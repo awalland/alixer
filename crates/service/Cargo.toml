@@ -1,0 +1,21 @@
+[package]
+name = "alixer-service"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+[[bin]]
+name = "alixerd"
+path = "src/main.rs"
+[[bin]]
+name = "alixerctl"
+path = "src/ctl.rs"
+[dependencies]
+alixer-core.workspace = true
+alixer-protocol.workspace = true
+alixer-audio.workspace = true
+alixer-lv2.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rusqlite = "0.40"
+libc.workspace = true

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Alixer
+GenericName=Audio Mixer
+Comment=Alixer - A Linux Mixer
+Exec=alixer
+Icon=multimedia-volume-control
+Categories=AudioVideo;Audio;Mixer;
+Terminal=false
