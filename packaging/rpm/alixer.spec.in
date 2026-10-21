@@ -1,0 +1,113 @@
+Name:           alixer
+Version:        @VERSION@
+Release:        1%{?dist}
+Summary:        Alixer - A Linux Mixer
+License:        @LICENSE@
+Source0:        %{name}-%{version}.tar.zst
+Source1:        %{name}-%{version}-vendor.tar.zst
+ExclusiveArch:  x86_64 aarch64
+
+# Release binaries are stripped; retain the source and bundled license notices.
+%global debug_package %{nil}
+%{!?alixer_jobs:%global alixer_jobs 2}
+
+BuildRequires:  rust >= 1.95
+BuildRequires:  cargo >= 1.95
+BuildRequires:  clang
+%if 0%{?suse_version}
+BuildRequires:  libclang13
+%else
+BuildRequires:  clang-libs
+%endif
+BuildRequires:  gcc
+BuildRequires:  pkgconfig(libpipewire-0.3)
+BuildRequires:  pkgconfig(libspa-0.2)
+BuildRequires:  pkgconfig(sqlite3)
+BuildRequires:  systemd-rpm-macros
+BuildRequires:  desktop-file-utils
+BuildRequires:  zstd
+BuildRequires:  liblilv-0.so.0()(64bit)
+
+Requires:       pipewire
+Requires:       wireplumber >= 0.5
+Requires:       systemd
+# Lilv and window-system libraries are loaded at runtime, so ELF dependency
+# generation alone cannot discover them. These names work across RPM distros.
+Requires:       liblilv-0.so.0()(64bit)
+Requires:       libwayland-client.so.0()(64bit)
+Requires:       libwayland-cursor.so.0()(64bit)
+Requires:       libxkbcommon.so.0()(64bit)
+Requires:       libX11.so.6()(64bit)
+Requires:       libX11-xcb.so.1()(64bit)
+Requires:       libXcursor.so.1()(64bit)
+Requires:       libXi.so.6()(64bit)
+Requires:       libXrandr.so.2()(64bit)
+Requires:       libxcb.so.1()(64bit)
+Requires:       libEGL.so.1()(64bit)
+Requires:       libGL.so.1()(64bit)
+Recommends:     libvulkan.so.1()(64bit)
+
+%description
+A dark mixing console for Linux with playback, group, aux and output strips,
+per-channel routing, LV2 effects and a persistent PipeWire audio engine.
+The GUI is independent of a systemd user service. WirePlumber integration is
+activated separately for each user with alixerctl enable.
+
+%prep
+%setup -q
+tar --zstd -xf %{SOURCE1}
+mkdir -p .cargo
+cp vendor-config.toml .cargo/config.toml
+
+%build
+export CARGO_BUILD_JOBS=%{alixer_jobs}
+export CARGO_TARGET_DIR=%{_topdir}/cargo-target
+cargo build --workspace --release --frozen
+
+%check
+export CARGO_BUILD_JOBS=%{alixer_jobs}
+export CARGO_TARGET_DIR=%{_topdir}/cargo-target
+export ALIXER_LILV_LIBRARY=liblilv-0.so.0
+cargo test --workspace --release --frozen
+desktop-file-validate integration/org.alixer.Alixer.desktop
+
+%install
+install -Dpm0755 %{_topdir}/cargo-target/release/alixer %{buildroot}%{_bindir}/alixer
+install -Dpm0755 %{_topdir}/cargo-target/release/alixerd %{buildroot}%{_bindir}/alixerd
+install -Dpm0755 %{_topdir}/cargo-target/release/alixerctl %{buildroot}%{_bindir}/alixerctl
+install -d %{buildroot}%{_userunitdir}
+sed 's|@ALIXERD@|%{_bindir}/alixerd|g' integration/alixer.service > %{buildroot}%{_userunitdir}/alixer.service
+install -Dpm0644 integration/alixer-guard.lua %{buildroot}%{_datadir}/wireplumber/scripts/alixer-guard.lua
+# This is an opt-in template, not a globally activated WirePlumber fragment.
+install -Dpm0644 integration/90-alixer.conf %{buildroot}%{_datadir}/alixer/wireplumber/90-alixer.conf
+install -Dpm0644 packaging/rpm/90-alixer.preset %{buildroot}%{_userpresetdir}/90-alixer.preset
+desktop-file-install --dir=%{buildroot}%{_datadir}/applications integration/org.alixer.Alixer.desktop
+cp packaging/rpm/README.md RPM-PACKAGING.md
+
+%if 0%{?suse_version}
+%pre
+%systemd_user_pre alixer.service
+%endif
+
+%post
+%systemd_user_post alixer.service
+
+%preun
+%systemd_user_preun alixer.service
+
+%postun
+%systemd_user_postun alixer.service
+
+%files
+%license LICENSE third-party-licenses
+%doc README.md RPM-PACKAGING.md
+%{_bindir}/alixer
+%{_bindir}/alixerd
+%{_bindir}/alixerctl
+%{_userunitdir}/alixer.service
+%{_userpresetdir}/90-alixer.preset
+%{_datadir}/applications/org.alixer.Alixer.desktop
+%dir %{_datadir}/alixer
+%dir %{_datadir}/alixer/wireplumber
+%{_datadir}/alixer/wireplumber/90-alixer.conf
+%{_datadir}/wireplumber/scripts/alixer-guard.lua

@@ -3,6 +3,7 @@
 import array, json, math, os, pathlib, shutil, socket, subprocess, sys, tempfile, time, wave
 
 ROOT=pathlib.Path(__file__).resolve().parents[1]
+BIN=pathlib.Path(os.environ.get("ALIXER_TEST_BIN_DIR",ROOT/"target/debug")).resolve()
 if "--session" not in sys.argv and "--offline" not in sys.argv:
     raise SystemExit(subprocess.call(["dbus-run-session","--",sys.executable,__file__,"--session"]))
 
@@ -18,6 +19,8 @@ with tempfile.TemporaryDirectory(prefix="alixer-test-") as tmp:
     root=pathlib.Path(tmp)
     env=os.environ.copy()
     env.update(XDG_RUNTIME_DIR=str(root/"run"),XDG_CONFIG_HOME=str(root/"config"),XDG_DATA_HOME=str(root/"data"),GIO_USE_VFS="local",XDG_STATE_HOME=str(root/"state"),ALIXER_STATE_DIR=str(root/"state/alixer"))
+    if "ALIXER_TEST_BIN_DIR" in os.environ:
+        env["XDG_DATA_DIRS"]=str(BIN.parent/"share")+":"+env.get("XDG_DATA_DIRS","/usr/local/share:/usr/share")
     for name in ("run","config","state"): (root/name).mkdir(mode=0o700)
     children=[]; logs=[]
     def spawn(args):
@@ -39,7 +42,7 @@ with tempfile.TemporaryDirectory(prefix="alixer-test-") as tmp:
         return subprocess.check_output(args,env=env,text=True,stderr=subprocess.PIPE)
     try:
         if "--offline" in sys.argv:
-            daemon=spawn(["target/debug/alixerd","--offline"])
+            daemon=spawn([str(BIN/"alixerd"),"--offline"])
             wait(snapshot,"offline service")
             assert (root/"run/alixer/control.sock").stat().st_mode & 0o777 == 0o600
             edit(dict(type="AddBus",name="Music",aux=False,channels=["FL","FR"]))
@@ -51,13 +54,13 @@ with tempfile.TemporaryDirectory(prefix="alixer-test-") as tmp:
             stale=request({"type":"Edit","value":dict(type="Mute",strip=strip,value=True)},0)
             assert "Err" in stale["result"]
             daemon.terminate();assert daemon.wait(timeout=5)==0
-            daemon=spawn(["target/debug/alixerd","--offline"])
+            daemon=spawn([str(BIN/"alixerd"),"--offline"])
             state=wait(snapshot,"restarted service")
             assert state["scene"]["strips"][0]["gain"]==.4,state
             assert all(r["gain"]==.7 and r["tap"]=="Pre" for r in state["scene"]["routes"])
             edit(dict(type="RemoveAuxSend",source=strip,aux=aux))
             daemon.terminate();assert daemon.wait(timeout=5)==0
-            daemon=spawn(["target/debug/alixerd","--offline"])
+            daemon=spawn([str(BIN/"alixerd"),"--offline"])
             state=wait(snapshot,"service after final-send deletion")
             assert any(s["id"]==aux for s in state["scene"]["strips"]) and not state["scene"]["routes"]
             daemon.terminate();assert daemon.wait(timeout=5)==0
@@ -66,7 +69,7 @@ with tempfile.TemporaryDirectory(prefix="alixer-test-") as tmp:
             legacy=root/"state/lixer"
             current.rename(legacy)
             (legacy/"ui.json").write_text(json.dumps(dict(zoom=1.5,hidden_strips=[aux])))
-            daemon=spawn(["target/debug/alixerd","--offline"])
+            daemon=spawn([str(BIN/"alixerd"),"--offline"])
             state=wait(snapshot,"renamed service migrates old state")
             assert state["scene"]==saved_scene
             assert json.loads((current/"ui.json").read_text())["hidden_strips"]==[aux]
@@ -80,14 +83,17 @@ with tempfile.TemporaryDirectory(prefix="alixer-test-") as tmp:
             legacy_integration=[root/"data/wireplumber/scripts/lixer-guard.lua",conf/"90-lixer.conf",root/"config/systemd/user/lixer.service"]
             for path in legacy_integration:
                 path.parent.mkdir(parents=True,exist_ok=True);path.write_text("old integration")
-            command(["target/debug/alixerctl","enable"])
+            command([str(BIN/"alixerctl"),"enable"])
+            if "ALIXER_TEST_BIN_DIR" in os.environ:
+                assert not (root/"config/systemd/user/alixer.service").exists(),"use package-owned service"
+                assert not (root/"data/wireplumber/scripts/alixer-guard.lua").exists(),"use package-owned Lua script"
             assert not any(path.exists() for path in legacy_integration),"new installation replaces legacy integration"
             wp=spawn(["wireplumber"])
             time.sleep(1)
             for name in ("test.speakers","test.headphones"):
                 layout="FL FR" if name=="test.speakers" else "FL FR FC LFE RL RR SL SR"
                 command(["pw-cli","create-node","adapter",'{ factory.name = support.null-audio-sink node.name = "'+name+'" node.description = "'+name+'" media.class = Audio/Sink audio.position = [ '+layout+' ] object.linger = true }'])
-            daemon=spawn(["target/debug/alixerd"])
+            daemon=spawn([str(BIN/"alixerd")])
             wait(snapshot,"audio service")
             wait(lambda:len(snapshot()["observation"]["outputs"])>=2,"virtual outputs")
             def masters():return [s for s in snapshot()["scene"]["strips"] if s["kind"]=="Output"]
@@ -138,7 +144,7 @@ with tempfile.TemporaryDirectory(prefix="alixer-test-") as tmp:
                 return any(o.get("info",{}).get("props",{}).get("link.output.node")==stream_node and o.get("info",{}).get("props",{}).get("link.input.node")==target_id for o in graph)
             command(["pw-metadata",str(stream_node),"target.object",legacy_ingress,"Spa:Id"])
             wait(lambda:stream_at(legacy_ingress),"stream parked on old Lixer ingress")
-            daemon=spawn(["target/debug/alixerd"])
+            daemon=spawn([str(BIN/"alixerd")])
             wait(snapshot,"Alixer service after legacy ingress parking")
             wait(lambda:stream_at("alixer.input."+strip),"surviving stream handed over to Alixer ingress")
             wait(lambda:any(p[1]>.1 for p in snapshot()["peaks"]),"audio restored after Lixer-to-Alixer handover")
@@ -192,7 +198,7 @@ with tempfile.TemporaryDirectory(prefix="alixer-test-") as tmp:
             command(["wpctl","set-mute",node,"0"])
             graph=json.loads(command(["pw-dump"]))
             assert any(o.get("info",{}).get("props",{}).get("node.name","").startswith("alixer.input.") for o in graph),"ingress must survive"
-            daemon=spawn(["target/debug/alixerd"])
+            daemon=spawn([str(BIN/"alixerd")])
             wait(snapshot,"service socket after restart")
             assert json.loads(names_conf.read_text())["monitor.alsa.rules"][0]["actions"]["update-props"]["node.description"]=="Desk speakers","service regenerates global rules from durable intent"
             wait(lambda:any(p[1]>.1 for p in snapshot()["peaks"]),"audio restored after restart")
@@ -214,6 +220,7 @@ with tempfile.TemporaryDirectory(prefix="alixer-test-") as tmp:
             # Exercise the real WirePlumber rule loader/matcher and PulseAudio
             # compatibility layer without requiring ALSA hardware in the test.
             scripts=root/"data/wireplumber/scripts"
+            scripts.mkdir(parents=True,exist_ok=True)
             (scripts/"alixer-output-name-test.lua").write_text('''
 local props = JsonUtils.match_rules_update_properties (
   Conf.get_section_as_json ("monitor.alsa.rules", Json.Array {}), {
@@ -242,6 +249,15 @@ wireplumber.profiles = { main = { custom.alixer-output-name-test = required } }
             wp.terminate();assert wp.wait(timeout=5)==0
             wp=spawn(["wireplumber"])
             wait(lambda:pulse_name()=="test.speakers","reset removes global name override")
+            if "ALIXER_TEST_BIN_DIR" in os.environ:
+                # Simulate package removal: the user fragment survives, but the
+                # package-owned script is no longer on WirePlumber's data path.
+                wp.terminate();assert wp.wait(timeout=5)==0
+                env["XDG_DATA_DIRS"]="/usr/local/share:/usr/share"
+                wp=spawn(["wireplumber"])
+                time.sleep(1)
+                assert wp.poll() is None,"leftover optional activation must not break WirePlumber"
+                command(["wpctl","status"])
             print("PASS: native discovery/DSP, legacy Lixer ingress handover, live aux controls, retained/deleted masters, device controls, downtime/hotplug reconciliation, and global output names/reset through WirePlumber and PulseAudio")
     except Exception:
         for i,log in enumerate(logs):

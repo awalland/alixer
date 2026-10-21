@@ -1,0 +1,2 @@
+# Audio routing is opt-in for each user.
+disable alixer.service

@@ -1,9 +1,9 @@
+mod integration;
 use alixer_protocol::*;
 use anyhow::{Context, Result, bail};
 use std::{
     io::{BufRead, BufReader, Read, Write},
     os::unix::net::UnixStream,
-    path::PathBuf,
 };
 fn exchange(command: Command, revision: Option<u64>) -> Result<Reply> {
     let frame_limit = reply_frame_limit(&command);
@@ -44,13 +44,13 @@ fn main() -> Result<()> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str).unwrap_or("snapshot") {
         "enable" => {
-            integration(true)?;
+            integration::configure(true)?;
             println!(
                 "Integration installed. Run systemctl --user daemon-reload, restart WirePlumber, then enable --now alixer.service."
             );
         }
         "disable" => {
-            integration(false)?;
+            integration::configure(false)?;
             println!(
                 "Integration removed. Stop alixer.service and restart WirePlumber to resume desktop routing."
             );
@@ -95,53 +95,6 @@ fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&reply)?);
             if let Err(e) = reply.result {
                 bail!("{e}");
-            }
-        }
-    }
-    Ok(())
-}
-fn integration(enable: bool) -> Result<()> {
-    let config = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config")
-        });
-    let root = config.join("wireplumber");
-    let data = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/share")
-        });
-    let script = data.join("wireplumber/scripts/alixer-guard.lua");
-    let conf = root.join("wireplumber.conf.d/90-alixer.conf");
-    if enable {
-        std::fs::create_dir_all(script.parent().unwrap())?;
-        std::fs::create_dir_all(conf.parent().unwrap())?;
-        std::fs::write(
-            script,
-            include_str!("../../../integration/alixer-guard.lua"),
-        )?;
-        std::fs::write(conf, include_str!("../../../integration/90-alixer.conf"))?;
-        let unit = config.join("systemd/user/alixer.service");
-        std::fs::create_dir_all(unit.parent().unwrap())?;
-        let daemon = std::env::current_exe()?.with_file_name("alixerd");
-        let text = include_str!("../../../integration/alixer.service")
-            .replace("@ALIXERD@", &daemon.to_string_lossy());
-        std::fs::write(unit, text)?;
-        // Replace the old installation rather than loading two fallback guards.
-        for legacy in [
-            data.join("wireplumber/scripts/lixer-guard.lua"),
-            root.join("wireplumber.conf.d/90-lixer.conf"),
-            config.join("systemd/user/lixer.service"),
-        ] {
-            if legacy.exists() {
-                std::fs::remove_file(legacy)?;
-            }
-        }
-    } else {
-        for path in [script, conf] {
-            if path.exists() {
-                std::fs::remove_file(path)?;
             }
         }
     }
