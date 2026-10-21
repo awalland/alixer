@@ -98,6 +98,7 @@ mod tests {
                 commands,
                 ctx: egui::Context::default(),
                 snapshot: Snapshot {
+                    active_streams: None,
                     scene: Scene {
                         strips,
                         ..Default::default()
@@ -210,6 +211,49 @@ mod tests {
     }
 
     #[test]
+    fn identical_playback_names_do_not_make_saved_strips_look_active() {
+        let mut h = Harness::new(vec![StripKind::Stream; 3], false);
+        let identity = Identity {
+            application: "Unknown application".into(),
+            name: "Playback".into(),
+            channels: vec!["MONO".into()],
+            ..Default::default()
+        };
+        for strip in &mut h.snapshot.scene.strips {
+            strip.identity = Some(identity.clone());
+        }
+        let active = h.snapshot.scene.strips[1].id;
+        h.snapshot.observation.streams.push(StreamObservation {
+            runtime: RuntimeId {
+                epoch: "server".into(),
+                serial: "42".into(),
+            },
+            identity,
+            volume: 1.0,
+            mute: false,
+            targets: vec![],
+            managed: None,
+        });
+        h.snapshot.active_streams = Some(vec![active]);
+        h.app.show_inactive = false;
+        h.frame(vec![]);
+        assert_eq!(h.panels.len(), 1);
+        assert!(h.labels.contains_key("Channel 1"));
+        h.app.show_inactive = true;
+        h.frame(vec![]);
+        assert_eq!(h.panels.len(), 3);
+        h.snapshot.active_streams = None;
+        h.snapshot.observation.streams[0].managed = Some(active);
+        h.app.show_inactive = false;
+        h.frame(vec![]);
+        assert_eq!(
+            h.panels.len(),
+            1,
+            "older service snapshots can use exact managed IDs too"
+        );
+    }
+
+    #[test]
     fn collapsed_name_is_draggable_and_cross_section_drops_are_rejected() {
         let mut h = Harness::new(
             vec![StripKind::Stream, StripKind::Stream, StripKind::Output],
@@ -293,11 +337,7 @@ impl App {
                             .inputs
                             .iter()
                             .any(|i| Some(&i.key) == strip.input_key.as_ref()),
-                        StripKind::Stream => snapshot
-                            .observation
-                            .streams
-                            .iter()
-                            .any(|s| Some(&s.identity) == strip.identity.as_ref()),
+                        StripKind::Stream => snapshot.stream_active(strip),
                         StripKind::Output => snapshot
                             .observation
                             .outputs

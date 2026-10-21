@@ -216,6 +216,7 @@ mod tests {
             let (app, commands) = test_app();
             let strip = Strip::new("Player", StripKind::Stream, vec!["FL".into(), "FR".into()]);
             let snapshot = Snapshot {
+                active_streams: None,
                 scene: Scene {
                     strips: vec![strip.clone()],
                     ..Default::default()
@@ -446,6 +447,7 @@ mod tests {
         output.output_key = Some("out".into());
         let aux = Strip::new("Aux1", StripKind::Aux, a.channels.clone());
         let snapshot = Snapshot {
+            active_streams: None,
             scene: Scene {
                 strips: vec![a, output, aux, b],
                 ..Default::default()

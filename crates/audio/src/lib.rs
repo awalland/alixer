@@ -70,7 +70,7 @@ fn topology_signature(apply: &Apply) -> String {
         })
         .collect();
     routes.sort_by_key(|r| r.0);
-    serde_json::to_string(&(strips, routes, &apply.bindings, &apply.suspended))
+    serde_json::to_string(&(strips, routes, &apply.suspended))
         .expect("Audio topology contains only serializable identifiers and channel layouts")
 }
 #[derive(Clone, Debug)]
@@ -545,7 +545,7 @@ fn run(
         if !ready.get(){return;}
         let mut state=controller.borrow_mut();
         let Controller{desired,render,signature,links,linked,ingresses,requested,render_error,states,rate}=&mut *state;
-        if let Some(current)=render.as_ref(){let observed=current.rate();if observed>0&&observed!=*rate{*rate=observed;signature.clear();}}
+        if let Some(current)=render.as_mut(){current.reclaim();let observed=current.rate();if observed>0&&observed!=*rate{*rate=observed;signature.clear();}}
         while let Ok(mut command)=rx.try_recv(){
             for control in command.output_controls.drain(..){
                 let g=graph.borrow();
@@ -558,6 +558,15 @@ fn run(
         if let Some(apply)=desired.as_ref() {
             let key=topology_signature(apply);
             if *signature!=key {
+                let rebuild=if let Some(current)=render.as_mut(){
+                    match current.reconfigure(&apply.scene,&apply.suspended,*rate){
+                        Ok(render::Reconfigure::Applied)=>{*signature=key.clone();render_error.clear();false}
+                        Ok(render::Reconfigure::Busy)=>false,
+                        Ok(render::Reconfigure::Rebuild)=>true,
+                        Err(e)=>{*render_error=format!("{e:#}");false}
+                    }
+                }else{true};
+                if rebuild {
                 links.clear();linked.clear();
                 let mut scene=apply.scene.clone();
                 if let Some(mut old)=render.take(){
@@ -568,6 +577,7 @@ fn run(
                 match render::Render::new(&core,&scene,&apply.suspended,*rate) {
                     Ok(new)=>{*render=Some(new);render_error.clear();*signature=key;}
                     Err(e)=>{*render_error=format!("{e:#}");}
+                }
                 }
             }
             if let Some(render)=render.as_mut() {
@@ -777,6 +787,8 @@ mod tests {
             output_controls: vec![],
         };
         let signature = topology_signature(&apply);
+        apply.bindings.insert("server:new-stream-incarnation".into(), source.id);
+        assert_eq!(topology_signature(&apply), signature, "runtime bindings do not change the DSP graph");
         for edit in [
             Edit::Color {
                 strip: source.id,

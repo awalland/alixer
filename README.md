@@ -150,7 +150,9 @@ python3 tests/capture.py
 Runtime tests start private PipeWire, WirePlumber, and D-Bus instances with
 temporary config, runtime, and state directories. They do not change desktop audio
 configuration. Live tests require their executables, `pipewire-pulse`, `pactl`,
-`wpctl`, `pw-cli`, `pw-dump`, `pw-play`, and `pw-record`.
+`wpctl`, `pw-cli`, `pw-dump`, `pw-play`, `pw-record`, and a C compiler (`cc`)
+for the test-only LV2 fixture. The live test checks uninterrupted playback and
+plugin lifetime while unrelated streams open and close.
 
 ### Native LV2 tests
 

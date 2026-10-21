@@ -318,6 +318,7 @@ mod tests {
                 })
                 .collect();
             let snapshot = Snapshot {
+                active_streams: None,
                 scene,
                 observation: Observation {
                     outputs,

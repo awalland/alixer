@@ -26,6 +26,7 @@ fn reply(stream: &mut UnixStream) -> Reply {
 fn scanning_plugins_does_not_occupy_the_control_loop() {
     let (tx, rx) = mpsc::sync_channel(32);
     let public = Arc::new(Mutex::new(Snapshot {
+        active_streams: None,
         scene: Scene::default(),
         observation: Observation::default(),
         conflicts: vec![],

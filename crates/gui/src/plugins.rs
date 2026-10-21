@@ -314,6 +314,7 @@ mod tests {
                 });
             }
             let snapshot = Snapshot {
+                active_streams: None,
                 scene: Scene {
                     strips: vec![strip.clone()],
                     ..Default::default()

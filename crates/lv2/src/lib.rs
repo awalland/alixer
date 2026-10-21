@@ -123,7 +123,7 @@ struct Descriptor {
     run:unsafe extern "C" fn(Ptr,u32),
     deactivate:Option<unsafe extern "C" fn(Ptr)>,
     cleanup:unsafe extern "C" fn(Ptr),
-    extension:unsafe extern "C" fn(*const c_char)->*const c_void,
+    extension:Option<unsafe extern "C" fn(*const c_char)->*const c_void>,
 }
 #[repr(C)]
 struct NativeInstance { descriptor:*const Descriptor,handle:Ptr,pimpl:Ptr }
@@ -160,7 +160,7 @@ impl Instance {
                 ((*(*raw).descriptor).connect)((*raw).handle,port.index,location.cast());
             }
             if let Some(path)=&insert.state { this.restore_state(std::path::Path::new(path))?; }
-            let worker=((*(*raw).descriptor).extension)(c"http://lv2plug.in/ns/ext/worker#interface".as_ptr());
+            let worker=(*(*raw).descriptor).extension.map(|extension|extension(c"http://lv2plug.in/ns/ext/worker#interface".as_ptr())).unwrap_or(std::ptr::null());
             this.host.start_worker((*raw).handle,worker.cast());
             if let Some(activate)=(*(*raw).descriptor).activate{activate((*raw).handle);}
             Ok(this)

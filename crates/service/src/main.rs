@@ -71,6 +71,7 @@ fn main() -> Result<()> {
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
     let (tx, rx) = mpsc::sync_channel::<Incoming>(32);
     let initial = Snapshot {
+        active_streams: Some(vec![]),
         scene: saved.scene.clone(),
         observation: Observation::default(),
         conflicts: saved.conflicts.clone(),
@@ -186,6 +187,7 @@ fn main() -> Result<()> {
                 }
                 match &request.command {
                     Command::Snapshot => Ok(Payload::Snapshot(Snapshot {
+                        active_streams: Some(active_stream_ids(&actual, &saved.checkpoint)),
                         scene: saved.scene.clone(),
                         observation: actual.clone(),
                         conflicts: saved.conflicts.clone(),
@@ -351,6 +353,7 @@ fn main() -> Result<()> {
             *public
                 .lock()
                 .map_err(|_| anyhow::anyhow!("Snapshot lock poisoned"))? = Snapshot {
+                active_streams: Some(active_stream_ids(&actual, &saved.checkpoint)),
                 scene: saved.scene.clone(),
                 observation: actual.clone(),
                 conflicts: saved.conflicts.clone(),
@@ -371,6 +374,12 @@ fn main() -> Result<()> {
     std::fs::remove_file(socket)?;
     Ok(())
 }
+fn active_stream_ids(actual: &Observation, checkpoint: &Checkpoint) -> Vec<Id> {
+    actual.streams.iter().filter_map(|stream| {
+        checkpoint.bindings.get(&reconcile::runtime_key(&stream.runtime)).copied()
+    }).collect()
+}
+
 fn capture_states(saved: &mut Saved, states: Vec<alixer_audio::PluginState>) {
     for state in states {
         if let Some(strip) = saved.scene.strips.iter_mut().find(|s| s.id == state.strip) {

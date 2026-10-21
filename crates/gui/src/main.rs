@@ -255,12 +255,7 @@ impl App {
                 RichText::new(format!(
                     "{} inputs · {} streams · {} buses · {} outputs",
                     snapshot.observation.inputs.len(),
-                    snapshot
-                        .scene
-                        .strips
-                        .iter()
-                        .filter(|s| s.kind == StripKind::Stream)
-                        .count(),
+                    snapshot.observation.streams.len(),
                     snapshot
                         .scene
                         .strips
@@ -876,6 +871,7 @@ mod layout_tests {
         let strip = Strip::new("Music", StripKind::Stream, vec!["FL".into(), "FR".into()]);
         for peak in [0.5_f32, 1.0, 2.0] {
             let snapshot = Snapshot {
+                active_streams: None,
                 scene: Scene {
                     strips: vec![strip.clone()],
                     ..Default::default()
@@ -969,6 +965,7 @@ mod layout_tests {
                 scene.strips.push(target);
             }
             let snapshot = Snapshot {
+                active_streams: None,
                 scene,
                 observation: Observation::default(),
                 conflicts: vec![],

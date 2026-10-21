@@ -33,12 +33,27 @@ pub enum Command {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Snapshot {
+    /// Exact runtime-to-strip matches. None supports older service snapshots.
+    #[serde(default)]
+    pub active_streams: Option<Vec<Id>>,
     pub scene: Scene,
     pub observation: Observation,
     pub conflicts: Vec<Conflict>,
     pub status: String,
     pub peaks: Vec<(Id, f32)>,
     pub channel_peaks: Vec<(Id, Vec<f32>)>,
+}
+impl Snapshot {
+    pub fn stream_active(&self, strip: &Strip) -> bool {
+        if let Some(active) = &self.active_streams {
+            return active.contains(&strip.id);
+        }
+        self.observation.streams.iter().any(|stream| {
+            stream.managed == Some(strip.id)
+                || (stream.managed.is_none() && strip.identity.as_ref() == Some(&stream.identity)
+                    && self.scene.strips.iter().filter(|s| s.identity == strip.identity).count() == 1)
+        })
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Reply {

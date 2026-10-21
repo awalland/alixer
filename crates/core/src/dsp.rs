@@ -38,7 +38,62 @@ pub struct Processor {
     route_outputs: Vec<Option<usize>>,
 }
 
+/// Index mappings prepared off the audio thread for a block-boundary handover.
+pub struct RuntimeTransfer {
+    strips: Vec<(usize, usize)>,
+    routes: Vec<(usize, usize)>,
+}
+
 impl Processor {
+    pub fn prepare_transfer(&self, previous: &Scene) -> RuntimeTransfer {
+        RuntimeTransfer {
+            strips: self
+                .scene
+                .strips
+                .iter()
+                .enumerate()
+                .filter_map(|(new, s)| {
+                    previous
+                        .strips
+                        .iter()
+                        .position(|old| old.id == s.id)
+                        .map(|old| (new, old))
+                })
+                .collect(),
+            routes: self
+                .scene
+                .routes
+                .iter()
+                .enumerate()
+                .filter_map(|(new, r)| {
+                    previous
+                        .routes
+                        .iter()
+                        .position(|old| {
+                            old.id == r.id
+                                && old.source == r.source
+                                && old.destination == r.destination
+                                && old.source_channel == r.source_channel
+                                && old.target_channel == r.target_channel
+                        })
+                        .map(|old| (new, old))
+                })
+                .collect(),
+        }
+    }
+
+    /// No allocation or destruction: preserve gain ramps and delay-line history.
+    pub fn inherit_runtime(&mut self, previous: &mut Self, transfer: &RuntimeTransfer) {
+        for &(new, old) in &transfer.strips {
+            self.gains[new] = previous.gains[old];
+            self.latencies[new] = previous.latencies[old];
+        }
+        for &(new, old) in &transfer.routes {
+            self.route_gains[new] = previous.route_gains[old];
+            std::mem::swap(&mut self.delays[new], &mut previous.delays[old]);
+        }
+    }
+
     pub fn new(scene: Scene, max_frames: usize) -> Result<Self, ModelError> {
         scene.validate()?;
         let order = scene
@@ -296,6 +351,61 @@ impl Processor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn plan_handover_preserves_ramps_and_latency_history() {
+        let mut scene = Scene::default();
+        for name in ["slow", "dry"] {
+            let source = Strip::new(name, StripKind::Stream, vec!["MONO".into()]);
+            scene.routes.push(Route {
+                id: Id::new_v4(),
+                source: source.id,
+                destination: Destination::Output("out".into()),
+                source_channel: 0,
+                target_channel: 0,
+                gain: 0.5,
+                tap: Tap::Post,
+            });
+            scene.strips.push(source);
+        }
+        let ids: Vec<_> = scene.strips.iter().map(|s| s.id).collect();
+        let mut original = Processor::new(scene.clone(), 8).unwrap();
+        let mut reference = Processor::new(scene.clone(), 8).unwrap();
+        let feed = |dsp: &mut Processor, block: usize| {
+            dsp.clear();
+            dsp.set_latency(ids[0], 21);
+            for (channel, id) in ids.iter().enumerate() {
+                for (i, value) in dsp.input(*id, 0).unwrap().iter_mut().enumerate() {
+                    *value = ((block * 8 + i + channel * 7) % 13) as f32 / 13.0;
+                }
+            }
+            dsp.process(8, 48000.0);
+        };
+        for block in 0..12 {
+            feed(&mut original, block);
+            feed(&mut reference, block);
+        }
+        scene.strips.push(Strip::new(
+            "browser",
+            StripKind::Stream,
+            vec!["MONO".into()],
+        ));
+        scene.strips.reverse();
+        scene.routes.reverse();
+        let mut next = Processor::new(scene.clone(), 8).unwrap();
+        let transfer = next.prepare_transfer(&original.scene);
+        next.inherit_runtime(&mut original, &transfer);
+        for block in 12..40 {
+            feed(&mut next, block);
+            feed(&mut reference, block);
+            let (mut actual, mut expected) = ([0.0; 8], [0.0; 8]);
+            next.output("out", 0, &mut actual);
+            reference.output("out", 0, &mut expected);
+            assert_eq!(
+                actual, expected,
+                "block {block}: a graph edit must not reset live state"
+            );
+        }
+    }
     #[test]
     fn output_inserts_process_the_sum_once_and_device_controls_do_not_attenuate_dsp() {
         let mut scene = Scene::default();

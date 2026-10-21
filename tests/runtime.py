@@ -35,9 +35,14 @@ with tempfile.TemporaryDirectory(prefix="alixer-test-") as tmp:
         try:return request({"type":"Snapshot"})["result"]["Ok"]["value"]
         except (OSError,KeyError,ValueError):return None
     def edit(value):
-        reply=request({"type":"Edit","value":value},snapshot()["scene"]["revision"])
-        assert "Ok" in reply["result"],reply
-        return reply
+        for _ in range(20):
+            reply=request({"type":"Edit","value":value},snapshot()["scene"]["revision"])
+            if reply["result"].get("Err") == "Stale revision; refresh before editing":
+                time.sleep(.05)
+                continue
+            assert "Ok" in reply["result"],reply
+            return reply
+        raise AssertionError("Repeated concurrent scene changes during edit")
     def command(args):
         return subprocess.check_output(args,env=env,text=True,stderr=subprocess.PIPE)
     try:
@@ -79,6 +84,16 @@ with tempfile.TemporaryDirectory(prefix="alixer-test-") as tmp:
             assert legacy.exists(),"retain old plugin assets during migration"
             print("PASS: private IPC, durable intent, aux persistence, and Lixer-to-Alixer state/UI migration")
         else:
+            bundle=root/"plugins/continuity.lv2";bundle.mkdir(parents=True)
+            subprocess.check_call(["cc","-shared","-fPIC","-O2",str(ROOT/"tests/continuity.c"),"-o",str(bundle/"continuity.so")])
+            (bundle/"manifest.ttl").write_text('@prefix lv2: <http://lv2plug.in/ns/lv2core#> .\n@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n<urn:alixer:test:continuity> a lv2:Plugin ; lv2:binary <continuity.so> ; rdfs:seeAlso <continuity.ttl> .')
+            ports=[]
+            for i in range(4):
+                direction="InputPort" if i<2 else "OutputPort"
+                ports.append(f'[ a lv2:{direction}, lv2:AudioPort ; lv2:index {i} ; lv2:symbol "port{i}" ; lv2:name "Port {i}" ]')
+            (bundle/"continuity.ttl").write_text('@prefix lv2: <http://lv2plug.in/ns/lv2core#> .\n@prefix doap: <http://usefulinc.com/ns/doap#> .\n<urn:alixer:test:continuity> a lv2:Plugin ; doap:name "Continuity fixture" ; lv2:port '+', '.join(ports)+' .')
+            events=root/"plugin-events"
+            env.update(LV2_PATH=str(root/"plugins"),ALIXER_TEST_PLUGIN_EVENTS=str(events))
             conf=root/"config/wireplumber/wireplumber.conf.d";conf.mkdir(parents=True)
             (conf/"99-test.conf").write_text('wireplumber.profiles = { main = { monitor.alsa = disabled monitor.bluez = disabled monitor.v4l2 = disabled monitor.libcamera = disabled } }')
             spawn(["pipewire"])
@@ -134,6 +149,37 @@ with tempfile.TemporaryDirectory(prefix="alixer-test-") as tmp:
             state=wait(lambda:(s if any(strip["kind"]=="Stream" for strip in s["scene"]["strips"]) else None) if (s:=snapshot()) else None,"playback strip")
             strip=next(s["id"] for s in state["scene"]["strips"] if s["kind"]=="Stream")
             state=wait(lambda:(s if any(p[1]>.1 for p in s["peaks"]) else None) if (s:=snapshot()) else None,"audio rendered through mixer")
+            assert strip in snapshot()["active_streams"],"publish exact active strip bindings"
+            edit(dict(type="AddInsert",strip=strip,uri="urn:alixer:test:continuity"))
+            wait(lambda:events.exists() and events.read_text()=="I","native LV2 fixture instantiated")
+            wait(lambda:any(p[1]>.1 for p in snapshot()["peaks"]),"audio restored after initial plugin insertion")
+            # Opening/closing unrelated browser streams must not interrupt music.
+            engine_names=lambda:sorted(o["info"]["props"]["node.name"] for o in json.loads(command(["pw-dump"])) if o.get("info",{}).get("props",{}).get("node.name","").startswith("alixer.engine."))
+            engine=engine_names()
+            silent=root/"silence.wav"
+            with wave.open(str(silent),"wb") as wav:
+                wav.setparams((2,2,48000,0,"NONE","not compressed"))
+                wav.writeframes(b"\0"*(48000*4*10))
+            continuity=root/"continuity.f32"
+            started=time.monotonic()
+            recorder=spawn(["pw-record","--target","test.speakers","--properties","{ stream.capture.sink = true }","--rate","48000","--channels","2","--format","f32","--raw","--sample-count","384000",str(continuity)])
+            time.sleep(.5)
+            for n in range(5):
+                browser=spawn(["pw-play","--target","test.speakers","--properties",f"{{ application.name = Browser{n} media.name = Browser{n} }}",str(silent)])
+                wait(lambda:any(s["identity"]["application"]==f"Browser{n}" and s["managed"] for s in snapshot()["observation"]["streams"]),"new browser stream managed")
+                assert engine_names()==engine,"stream additions must retain the engine and existing links"
+                time.sleep(.2)
+                browser.terminate();browser.wait(timeout=5)
+            recorder.wait(timeout=12)
+            assert time.monotonic()-started<9.5,"capture clock must not stall during stream changes"
+            samples=array.array("f");samples.frombytes(continuity.read_bytes())
+            assert len(samples)>=384000*2,"continuous capture must produce all samples"
+            mono=samples[::2]
+            windows=[mono[i:i+256] for i in range(24000,len(mono)-24000-256,256)]
+            assert windows and min(math.sqrt(sum(v*v for v in block)/len(block)) for block in windows)>.001,"new streams must not produce silent gaps in existing music"
+            assert events.read_text()=="I","unrelated streams must not recreate or destroy a running LV2 instance"
+            wait(lambda:len(snapshot()["observation"]["streams"])==1,"temporary browser streams closed")
+            assert snapshot()["active_streams"]==[strip],"saved offline browser strips must not be marked active"
             # Reproduce an upgrade with a surviving stream on its old Lixer
             # ingress. The logical strip ID stays the same across the rename.
             daemon.terminate();assert daemon.wait(timeout=5)==0
@@ -262,7 +308,7 @@ wireplumber.profiles = { main = { custom.alixer-output-name-test = required } }
                 time.sleep(1)
                 assert wp.poll() is None,"leftover optional activation must not break WirePlumber"
                 command(["wpctl","status"])
-            print("PASS: native discovery/DSP, legacy Lixer ingress handover, live aux controls, retained/deleted masters, device controls, downtime/hotplug reconciliation, and global output names/reset through WirePlumber and PulseAudio")
+            print("PASS: native discovery/DSP, uninterrupted stream changes/LV2 reuse, exact active strips, legacy Lixer ingress handover, live aux controls, retained/deleted masters, device controls, downtime/hotplug reconciliation, and global output names/reset through WirePlumber and PulseAudio")
     except Exception:
         for i,log in enumerate(logs):
             log.flush();log.seek(0);print("\n--- child",i,"---\n",log.read()[-12000:],file=sys.stderr)
