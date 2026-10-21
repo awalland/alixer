@@ -251,7 +251,7 @@ impl Render {
         for strip in scene
             .strips
             .iter()
-            .filter(|s| s.kind == StripKind::Stream && !suspended.contains(&s.id))
+            .filter(|s| matches!(s.kind, StripKind::Stream | StripKind::Input) && !suspended.contains(&s.id))
         {
             for ch in 0..strip.channels.len() {
                 let name = format!("in_{}_{}", strip.id.simple(), ch);

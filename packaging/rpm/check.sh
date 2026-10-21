@@ -21,5 +21,6 @@ desktop-file-validate "$extracted/usr/share/applications/org.alixer.Alixer.deskt
 export ALIXER_TEST_BIN_DIR="$extracted/usr/bin"
 python3 "$root/tests/runtime.py" --offline
 python3 "$root/tests/runtime.py"
+python3 "$root/tests/capture.py"
 echo "PASS: RPM payload, desktop entry, packaged activation, persistence and private live audio"
 echo "Extracted test files: $extracted"

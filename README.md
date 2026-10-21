@@ -5,7 +5,7 @@ egui GUI.
 
 ![Alixer mixing console](img/screenshot.jpg)
 
-- Channel strips for playback applications, groups, aux masters, and outputs.
+- Channel strips for microphones, playback applications, groups, aux masters, and outputs.
 - Per-channel routing, mute/solo, and pre/post-fader aux sends.
 - LV2 insert effects with generic parameter controls.
 - A persistent audio service, independent of the GUI.
@@ -48,6 +48,7 @@ the GUI connects to the independently running service.
 | Collapse a strip | Right-click its name or background → **Hide** |
 | Restore a collapsed strip | Click **»** at its bottom |
 | Rename a strip | Right-click its name or background → **Rename…** |
+| Reorder strips | Drag a strip's name within its section |
 | Restore default colors | **Changes** → **Reset channel colors** |
 
 ### Routing
@@ -61,6 +62,22 @@ per row (`□ □ | □ □`).
 
 Mono sources can feed both sides of a stereo destination. Output masters are
 terminal: edit their incoming connections in the sending channel's routing box.
+
+### Microphones and meetings
+
+Microphones appear as amber **MIC / INPUT** strips. To use one in a meeting:
+
+1. In its routing box, enable both channels of **Alixer Microphone** (hover to
+   find them).
+2. Select **Alixer Microphone** as the input device in your meeting application.
+3. Use the microphone strip's fader, mute, and LV2 inserts to control your voice.
+
+New microphones start unrouted. Route them to headphones only if you want to
+monitor yourself; routing to speakers can cause feedback. The virtual microphone
+works with the GUI closed and stays silent if the Alixer service stops.
+Input faders control the Alixer signal; hardware microphone gain remains in your
+system's input settings. Meeting applications using the hardware microphone
+directly bypass Alixer's controls.
 
 ### Aux sends
 
@@ -127,12 +144,13 @@ cargo test --workspace
 cargo build --workspace
 python3 tests/runtime.py --offline
 python3 tests/runtime.py
+python3 tests/capture.py
 ```
 
 Runtime tests start private PipeWire, WirePlumber, and D-Bus instances with
 temporary config, runtime, and state directories. They do not change desktop audio
-configuration. The live test requires their executables, `wpctl`, `pw-cli`,
-`pw-dump`, `pw-play`, and `pw-record`.
+configuration. Live tests require their executables, `pipewire-pulse`, `pactl`,
+`wpctl`, `pw-cli`, `pw-dump`, `pw-play`, and `pw-record`.
 
 ### Native LV2 tests
 

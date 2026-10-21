@@ -6,6 +6,7 @@ mod ipc_tests;
 mod plugins;
 mod preferences;
 mod strip_actions;
+mod strip_order;
 mod strip_routing;
 use alixer_core::*;
 use alixer_protocol::*;
@@ -28,8 +29,8 @@ const STRIP_NAME_HEIGHT: f32 = 64.0;
 
 fn output_masters(snapshot: &Snapshot, show_offline: bool) -> impl Iterator<Item = &Strip> {
     snapshot.scene.strips.iter().filter(move |s| {
-        s.kind == StripKind::Output
-            && (show_offline
+        s.kind.terminal()
+            && (s.kind == StripKind::VirtualMic || show_offline
                 || snapshot
                     .observation
                     .outputs
@@ -252,7 +253,8 @@ impl App {
             ui.heading("Mix console");
             ui.label(
                 RichText::new(format!(
-                    "{} streams · {} buses · {} outputs",
+                    "{} inputs · {} streams · {} buses · {} outputs",
+                    snapshot.observation.inputs.len(),
                     snapshot
                         .scene
                         .strips
@@ -289,55 +291,13 @@ impl App {
             });
             return;
         }
-        let mut groups: Vec<(String, Vec<&Strip>)> = vec![];
-        for strip in &snapshot.scene.strips {
-            if strip.kind != StripKind::Stream {
-                continue;
-            }
-            let active = strip.kind != StripKind::Stream
-                || snapshot.observation.streams.iter().any(|o| {
-                    snapshot
-                        .scene
-                        .strip(strip.id)
-                        .and_then(|s| s.identity.as_ref())
-                        == Some(&o.identity)
-                });
-            if !active && !self.show_inactive {
-                continue;
-            }
-            let app = strip
-                .identity
-                .as_ref()
-                .map(|i| i.application.clone())
-                .unwrap_or_else(|| "Unknown application".into());
-            if let Some((_, strips)) = groups.iter_mut().find(|(name, _)| name == &app) {
-                strips.push(strip);
-            } else {
-                groups.push((app, vec![strip]));
-            }
-        }
         let strip_height =
             (ui.available_height() - ui.spacing().scroll.allocated_width()).max(STRIP_MIN_HEIGHT);
         egui::ScrollArea::both()
             .id_salt("strip-bank")
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                ui.horizontal_top(|ui| {
-                    for (_, strips) in groups {
-                        for strip in strips {
-                            self.strip(ui, strip, snapshot, strip_height);
-                        }
-                        ui.separator();
-                    }
-                    for kind in [StripKind::Group, StripKind::Aux] {
-                        for strip in snapshot.scene.strips.iter().filter(|s| s.kind == kind) {
-                            self.strip(ui, strip, snapshot, strip_height);
-                        }
-                    }
-                    for strip in output_masters(snapshot, self.show_inactive) {
-                        self.strip(ui, strip, snapshot, strip_height);
-                    }
-                });
+                self.strip_bank(ui, snapshot, strip_height);
             });
     }
     fn strip(
@@ -351,13 +311,15 @@ impl App {
             return self.collapsed_strip(ui, strip, height);
         }
         let selected = self.selected == Some(strip.id);
-        let output = strip.kind == StripKind::Output;
-        let online = !output
+        let output = strip.kind.terminal();
+        let online = if strip.kind == StripKind::Input {
+            snapshot.observation.inputs.iter().any(|i| Some(&i.key) == strip.input_key.as_ref())
+        } else { strip.kind != StripKind::Output
             || snapshot
                 .observation
                 .outputs
                 .iter()
-                .any(|o| Some(&o.key) == strip.output_key.as_ref());
+                .any(|o| Some(&o.key) == strip.output_key.as_ref()) };
         let frame = egui::Frame::new()
             .fill(PANEL)
             .stroke(egui::Stroke::new(
@@ -379,13 +341,13 @@ impl App {
             let background=ui.interact(ui.max_rect(),ui.id().with(("strip-background",strip.id)),egui::Sense::click());
             let color=Color32::from_rgb(strip.color[0],strip.color[1],strip.color[2]);
             let(rect,_)=ui.allocate_exact_size(Vec2::new(ui.available_width(),3.0),egui::Sense::hover());ui.painter().rect_filled(rect,2.0,color);
-            ui.label(RichText::new(match strip.kind{StripKind::Stream=>"PLAYBACK",StripKind::Group=>"GROUP",StripKind::Aux=>"AUX",StripKind::Output=>if online{"OUTPUT"}else{"OUTPUT · OFFLINE"}}).small().color(DIM));
+            ui.label(RichText::new(match strip.kind{StripKind::Stream=>"PLAYBACK",StripKind::Input=>if online{"MIC / INPUT"}else{"INPUT · OFFLINE"},StripKind::VirtualMic=>"VIRTUAL MIC",StripKind::Group=>"GROUP",StripKind::Aux=>"AUX",StripKind::Output=>if online{"OUTPUT"}else{"OUTPUT · OFFLINE"}}).small().color(DIM));
             self.routing_rack(ui,strip,snapshot);
             self.aux_rack(ui,strip,snapshot);
             self.plugin_rack(ui,strip,((height-460.0)*0.45).clamp(96.0,360.0));
             ui.horizontal(|ui|{
                 let mut mute=strip.mute;if ui.add_enabled(online,egui::Button::selectable(mute,RichText::new("M").color(if strip.mute{RED}else{DIM}))).clicked(){mute=!mute;self.edit(Edit::Mute{strip:strip.id,value:mute});}
-                if strip.kind==StripKind::Stream{let mut solo=strip.solo;if ui.toggle_value(&mut solo,RichText::new("S").color(if strip.solo{MINT}else{DIM})).changed(){self.edit(Edit::Solo{strip:strip.id,value:solo});}}
+                if matches!(strip.kind,StripKind::Stream|StripKind::Input){let mut solo=strip.solo;if ui.toggle_value(&mut solo,RichText::new("S").color(if strip.solo{MINT}else{DIM})).changed(){self.edit(Edit::Solo{strip:strip.id,value:solo});}}
             });
             ui.add_space(6.0);
             let footer_height=STRIP_NAME_HEIGHT+2.0*ui.spacing().interact_size.y+2.0*ui.text_style_height(&egui::TextStyle::Small)+5.0*ui.spacing().item_spacing.y;
@@ -399,7 +361,7 @@ impl App {
                 let width=if output{(peaks.len()as f32*10.0).clamp(15.0,80.0)}else{15.0};
                 let(rect,response)=ui.allocate_exact_size(Vec2::new(width,fader_height),egui::Sense::hover());
                 let levels=peaks.iter().map(|p|if *p<=0.0{"−∞ dBFS".into()}else{format!("{:.1} dBFS",20.0*p.log10())}).collect::<Vec<String>>().join(" / ");
-                response.on_hover_text(if output{format!("{}\n{}\nAfter inserts, before device volume/mute",strip.channels.join(" / "),levels)}else{format!("Post-fader signal\n{levels}")});
+                response.on_hover_text(if strip.kind==StripKind::Output{format!("{}\n{}\nAfter inserts, before device volume/mute",strip.channels.join(" / "),levels)}else{format!("Post-fader signal\n{levels}")});
                 for(ch,peak)in peaks.iter().enumerate(){
                     let mut meter=rect;let step=width/peaks.len().max(1)as f32;meter.min.x+=ch as f32*step;meter.max.x=meter.min.x+(step-1.0).max(0.5);
                     ui.painter().rect_filled(meter,2.0,Color32::from_gray(12));
@@ -420,7 +382,8 @@ impl App {
             let name_top=ui.max_rect().bottom()-STRIP_NAME_HEIGHT;
             ui.add_space((name_top-ui.cursor().top()).max(0.0));
             egui::ScrollArea::vertical().id_salt(("strip-name",strip.id)).max_height(STRIP_NAME_HEIGHT).min_scrolled_height(STRIP_NAME_HEIGHT).auto_shrink([false,false]).show(ui,|ui|{
-                let label=ui.add(egui::Label::new(RichText::new(&strip.name).strong()).wrap().sense(egui::Sense::click())).on_hover_cursor(egui::CursorIcon::PointingHand);
+                let label=ui.add(egui::Label::new(RichText::new(&strip.name).strong()).wrap().sense(egui::Sense::click_and_drag()));
+                self.strip_drag_handle(&label,strip);
                 if label.clicked(){self.selected=Some(strip.id);}
                 self.strip_context_menu(&label,strip);
             });

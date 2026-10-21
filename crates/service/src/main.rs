@@ -211,8 +211,11 @@ fn main() -> Result<()> {
                         }
                         let mut next = saved.clone();
                         if let Edit::Gain { strip, .. } | Edit::Mute { strip, .. } = edit {
-                            if let Some(key) =
-                                next.scene.strip(*strip).and_then(|s| s.output_key.as_ref())
+                            if let Some(key) = next
+                                .scene
+                                .strip(*strip)
+                                .filter(|s| s.kind == alixer_core::StripKind::Output)
+                                .and_then(|s| s.output_key.as_ref())
                             {
                                 if !status.starts_with("Connected")
                                     || !actual.outputs.iter().any(|o| &o.key == key)
@@ -272,8 +275,11 @@ fn main() -> Result<()> {
                             _ => None,
                         };
                         if let Some((id, gain, mute)) = control {
-                            if let Some(key) =
-                                saved.scene.strip(id).and_then(|s| s.output_key.clone())
+                            if let Some(key) = saved
+                                .scene
+                                .strip(id)
+                                .filter(|s| s.kind == alixer_core::StripKind::Output)
+                                .and_then(|s| s.output_key.clone())
                             {
                                 output_controls.push(alixer_audio::OutputControl {
                                     key,

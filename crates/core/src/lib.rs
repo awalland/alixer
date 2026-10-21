@@ -4,6 +4,8 @@ mod aux_tests;
 pub mod dsp;
 #[cfg(test)]
 mod output_name_tests;
+#[cfg(test)]
+mod input_tests;
 pub mod reconcile;
 
 use serde::{Deserialize, Serialize};
@@ -23,9 +25,11 @@ pub struct Identity {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StripKind {
     Stream,
+    Input,
     Group,
     Aux,
     Output,
+    VirtualMic,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -43,6 +47,8 @@ pub struct Strip {
     pub name: String,
     pub kind: StripKind,
     pub identity: Option<Identity>,
+    #[serde(default)]
+    pub input_key: Option<String>,
     #[serde(default)]
     pub output_key: Option<String>,
     #[serde(default)]
@@ -63,8 +69,9 @@ pub struct Strip {
 impl Strip {
     pub fn default_color(kind: &StripKind) -> [u8; 3] {
         match kind {
-            StripKind::Output => [35, 24, 151],
+            StripKind::Output | StripKind::VirtualMic => [35, 24, 151],
             StripKind::Aux => [119, 24, 151],
+            StripKind::Input => [224, 164, 62],
             _ => [91, 174, 170],
         }
     }
@@ -75,6 +82,7 @@ impl Strip {
             name: name.into(),
             kind,
             identity: None,
+            input_key: None,
             output_key: None,
             output_name_override: None,
             output_original_name: None,
@@ -160,6 +168,23 @@ pub struct StreamObservation {
 pub struct Observation {
     pub streams: Vec<StreamObservation>,
     pub outputs: Vec<Output>,
+    #[serde(default)]
+    pub inputs: Vec<Input>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Input {
+    pub key: String,
+    pub name: String,
+    pub channels: Vec<String>,
+}
+
+pub const MICROPHONE_KEY: &str = "alixer.microphone";
+
+impl StripKind {
+    pub fn terminal(&self) -> bool {
+        matches!(self, Self::Output | Self::VirtualMic)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -292,7 +317,7 @@ impl Scene {
             Edit::Mute { strip, value } => self.strip_mut(strip)?.mute = value,
             Edit::Solo { strip, value } => {
                 let s = self.strip_mut(strip)?;
-                if s.kind != StripKind::Stream {
+                if !matches!(s.kind, StripKind::Stream | StripKind::Input) {
                     return Err(ModelError::Invalid);
                 }
                 s.solo = value;
@@ -346,7 +371,7 @@ impl Scene {
             )),
             Edit::AddAuxSend { source, aux } => {
                 let input = self.strip(source).ok_or(ModelError::Unknown)?.clone();
-                if input.kind == StripKind::Output {
+                if input.kind.terminal() {
                     return Err(ModelError::Invalid);
                 }
                 let target = if let Some(id) = aux {
@@ -415,7 +440,7 @@ impl Scene {
                     .retain(|r| !(r.source == source && r.destination == Destination::Bus(aux)));
             }
             Edit::RemoveStrip { strip } => {
-                if self.strip_mut(strip)?.kind == StripKind::Output {
+                if self.strip_mut(strip)?.kind.terminal() {
                     return Err(ModelError::Invalid);
                 }
                 self.strips.retain(|s| s.id != strip);
@@ -504,7 +529,7 @@ impl Scene {
             {
                 return Err(ModelError::Invalid);
             }
-            if s.kind == StripKind::Output {
+            if s.kind.terminal() {
                 if s.output_name_override
                     .as_ref()
                     .is_some_and(|name| name != &s.name)
@@ -525,6 +550,13 @@ impl Scene {
             {
                 return Err(ModelError::Invalid);
             }
+            if (s.kind == StripKind::Input) != s.input_key.is_some()
+                || s.input_key.as_ref().is_some_and(|key| key.is_empty())
+                || (s.kind == StripKind::VirtualMic
+                    && s.output_key.as_deref() != Some(MICROPHONE_KEY))
+            {
+                return Err(ModelError::Invalid);
+            }
         }
         let mut route_ids = BTreeSet::new();
         for r in &self.routes {
@@ -532,7 +564,7 @@ impl Scene {
                 return Err(ModelError::Invalid);
             }
             let source = self.strip(r.source).ok_or(ModelError::Unknown)?;
-            if source.kind == StripKind::Output
+            if source.kind.terminal()
                 || r.source_channel >= source.channels.len()
                 || r.target_channel >= 64
             {
@@ -552,7 +584,7 @@ impl Scene {
     fn require_aux_send(&self, source: Id, aux: Id) -> Result<(), ModelError> {
         let input = self.strip(source).ok_or(ModelError::Unknown)?;
         let target = self.strip(aux).ok_or(ModelError::Unknown)?;
-        if input.kind == StripKind::Output || target.kind != StripKind::Aux {
+        if input.kind.terminal() || target.kind != StripKind::Aux {
             return Err(ModelError::Invalid);
         }
         if !self
@@ -581,7 +613,7 @@ impl Scene {
     }
     pub fn audible(&self, strip: &Strip) -> bool {
         !strip.mute
-            && (strip.kind != StripKind::Stream
+            && (!matches!(strip.kind, StripKind::Stream | StripKind::Input)
                 || !self.strips.iter().any(|s| s.solo)
                 || strip.solo)
     }
@@ -601,7 +633,7 @@ pub fn aux_send_channels(
     source: &Strip,
     target: &Strip,
 ) -> Result<Vec<(usize, usize)>, ModelError> {
-    if source.kind == StripKind::Output || target.kind != StripKind::Aux || source.id == target.id {
+    if source.kind.terminal() || target.kind != StripKind::Aux || source.id == target.id {
         return Err(ModelError::Invalid);
     }
     if source.channels.len() == 1 && target.channels.len() <= 2 {

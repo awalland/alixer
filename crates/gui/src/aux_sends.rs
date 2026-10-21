@@ -103,7 +103,7 @@ impl App {
                     ui.id().with(("aux-rack", strip.id)),
                     egui::Sense::click(),
                 );
-                if strip.kind == StripKind::Output {
+                if strip.kind.terminal() {
                     background.on_hover_text(
                         "Terminal output. Aux sends are available on playback strips and buses.",
                     );

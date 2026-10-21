@@ -29,7 +29,7 @@ with tempfile.TemporaryDirectory(prefix="alixer-test-") as tmp:
     def request(command,revision=None):
         with socket.socket(socket.AF_UNIX) as s:
             s.settimeout(5);s.connect(str(root/"run/alixer/control.sock"))
-            s.sendall((json.dumps(dict(version=5,id=1,revision=revision,command=command))+"\n").encode())
+            s.sendall((json.dumps(dict(version=6,id=1,revision=revision,command=command))+"\n").encode())
             return json.loads(s.makefile().readline())
     def snapshot():
         try:return request({"type":"Snapshot"})["result"]["Ok"]["value"]
@@ -53,10 +53,13 @@ with tempfile.TemporaryDirectory(prefix="alixer-test-") as tmp:
             edit(dict(type="SetAuxSend",source=strip,aux=aux,gain=.7,tap="Pre"))
             stale=request({"type":"Edit","value":dict(type="Mute",strip=strip,value=True)},0)
             assert "Err" in stale["result"]
+            order=[s["id"] for s in reversed(snapshot()["scene"]["strips"])]
+            edit(dict(type="Reorder",strips=order))
             daemon.terminate();assert daemon.wait(timeout=5)==0
             daemon=spawn([str(BIN/"alixerd"),"--offline"])
             state=wait(snapshot,"restarted service")
-            assert state["scene"]["strips"][0]["gain"]==.4,state
+            assert next(s for s in state["scene"]["strips"] if s["id"]==strip)["gain"]==.4,state
+            assert [s["id"] for s in state["scene"]["strips"]]==order,"strip order survives service restart"
             assert all(r["gain"]==.7 and r["tap"]=="Pre" for r in state["scene"]["routes"])
             edit(dict(type="RemoveAuxSend",source=strip,aux=aux))
             daemon.terminate();assert daemon.wait(timeout=5)==0
@@ -156,6 +159,7 @@ with tempfile.TemporaryDirectory(prefix="alixer-test-") as tmp:
             aux=next(s["id"] for s in snapshot()["scene"]["strips"] if s["kind"]=="Aux")
             assert not any(r["source"]==aux for r in snapshot()["scene"]["routes"]),"new aux master must be unrouted"
             wait(lambda:any(id==aux for id,values in snapshot()["channel_peaks"]),"aux master compiled")
+            wait(lambda:any(p[1]>.1 for p in snapshot()["peaks"]),"audio restored after aux graph insertion")
             def engines():return sorted(o["info"]["props"]["node.name"] for o in json.loads(command(["pw-dump"])) if o.get("info",{}).get("props",{}).get("node.name","").startswith("alixer.engine."))
             engine=engines()
             for channel in (strip,aux,speaker_id):

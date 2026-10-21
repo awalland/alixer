@@ -45,6 +45,7 @@ fn topology_signature(apply: &Apply) -> String {
                 s.id,
                 &s.kind,
                 &s.output_key,
+                &s.input_key,
                 &s.channels,
                 s.inserts
                     .iter()
@@ -215,7 +216,18 @@ impl Graph {
             if name.starts_with("alixer.") || name.starts_with("lixer.") {
                 continue;
             }
-            if class == "Audio/Sink" {
+            if matches!(class, "Audio/Source" | "Audio/Source/Virtual") && !name.ends_with(".monitor")
+                && node.props.get("device.class").map(String::as_str) != Some("monitor")
+            {
+                let ports = self.ports(id, true);
+                if !ports.is_empty() {
+                    result.inputs.push(Input {
+                        key: name,
+                        name: node.props.get("node.description").cloned().unwrap_or_default(),
+                        channels: ports.iter().map(|p| p.2.clone()).collect(),
+                    });
+                }
+            } else if class == "Audio/Sink" {
                 let ports = self.ports(id, false);
                 result.outputs.push(Output {
                     key: name,
@@ -562,6 +574,28 @@ fn run(
                 render.update_controls(&apply.scene);
                 let g=graph.borrow();
                 linked.retain(|(source,target)|g.objects.values().any(|o|o.kind=="Link"&&o.props.get("link.output.port").and_then(|v|v.parse::<u32>().ok())==Some(*source)&&o.props.get("link.input.port").and_then(|v|v.parse::<u32>().ok())==Some(*target)));
+                for strip in apply.scene.strips.iter().filter(|s|s.kind==StripKind::VirtualMic) {
+                    let exists=g.objects.values().any(|o|o.kind=="Node"&&o.props.get("node.name").map(String::as_str)==Some(MICROPHONE_KEY));
+                    if !exists&&requested.insert(strip.id) {
+                        let props=properties!{"factory.name"=>"support.null-audio-sink","node.name"=>MICROPHONE_KEY,"node.description"=>"Alixer Microphone","media.class"=>"Audio/Source/Virtual","audio.channels"=>"2","audio.position"=>"[ FL FR ]","monitor.passthrough"=>"true","node.virtual"=>"true","object.linger"=>"true","priority.session"=>"-1000","monitor.channel-volumes"=>"false"};
+                        // Retain a silent endpoint on shutdown, just like playback
+                        // ingresses. Recorders must not fall back to the raw mic.
+                        match core.create_object::<pw::node::Node>("adapter",&props){Ok(node)=>ingresses.push(node),Err(e)=>{*render_error=e.to_string();requested.remove(&strip.id);}}
+                    }
+                }
+                for strip in apply.scene.strips.iter().filter(|s|s.kind==StripKind::Input) {
+                    let Some(source)=strip.input_key.as_ref() else{continue};
+                    if let Some((&id,_))=g.objects.iter().find(|(_,o)|o.kind=="Node"&&o.props.get("node.name")==Some(source)) {
+                        let ports=g.ports(id,true);
+                        for (ch,expected) in strip.channels.iter().enumerate() {
+                            let matches:Vec<_>=ports.iter().filter(|(_,_,channel)|channel==expected).collect();
+                            let port=ports.get(ch).filter(|(_,_,channel)|channel==expected).or_else(||if matches.len()==1{Some(matches[0])}else{None});
+                            if let (Some((_,port,_)),Some(input))=(port,render.input_name(strip.id,ch)) {
+                                wire(&core,&g,linked,links,source,port,&render.name,&input);
+                            }
+                        }
+                    }
+                }
                 for strip in apply.scene.strips.iter().filter(|s|s.kind==StripKind::Stream&&!apply.suspended.contains(&s.id)) {
                     let name=format!("alixer.input.{}",strip.id);
                     let ingress=g.objects.iter().find(|(_,o)|o.kind=="Node"&&o.props.get("node.name")==Some(&name)).map(|(id,_)|*id);

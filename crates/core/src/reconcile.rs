@@ -33,6 +33,44 @@ pub fn reconcile(
         bindings: BTreeMap::new(),
         external: BTreeMap::new(),
     };
+    for input in &actual.inputs {
+        if input.channels.is_empty()
+            || result
+                .scene
+                .strips
+                .iter()
+                .any(|s| s.input_key.as_ref() == Some(&input.key))
+        {
+            continue;
+        }
+        let mut strip = Strip::new(
+            if input.name.is_empty() {
+                &input.key
+            } else {
+                &input.name
+            },
+            StripKind::Input,
+            input.channels.clone(),
+        );
+        strip.input_key = Some(input.key.clone());
+        // New inputs are deliberately unrouted, including to speakers.
+        result.scene.strips.push(strip);
+    }
+    if !actual.inputs.is_empty()
+        && !result
+            .scene
+            .strips
+            .iter()
+            .any(|s| s.kind == StripKind::VirtualMic)
+    {
+        let mut mic = Strip::new(
+            "Alixer Microphone",
+            StripKind::VirtualMic,
+            vec!["FL".into(), "FR".into()],
+        );
+        mic.output_key = Some(MICROPHONE_KEY.into());
+        result.scene.strips.push(mic);
+    }
     for output in &actual.outputs {
         if output.channels.is_empty() {
             continue;
@@ -370,6 +408,7 @@ mod tests {
         let mut actual = Observation {
             streams: vec![stream()],
             outputs: vec![],
+            ..Default::default()
         };
         let first = reconcile(&Scene::default(), &Checkpoint::default(), &actual, &[]);
         let baseline = Checkpoint {
@@ -413,6 +452,7 @@ mod tests {
             &Observation {
                 streams: vec![stream()],
                 outputs: vec![],
+                ..Default::default()
             },
             &[],
         );
@@ -429,6 +469,7 @@ mod tests {
         let actual = Observation {
             streams: vec![stream()],
             outputs: vec![],
+            ..Default::default()
         };
         let first = reconcile(&Scene::default(), &Checkpoint::default(), &actual, &[]);
         let next = reconcile(&first.scene, &Checkpoint::default(), &actual, &[]);

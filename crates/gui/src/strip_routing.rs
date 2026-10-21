@@ -10,7 +10,7 @@ struct Pair {
 }
 
 fn pairs(strip: &Strip, snapshot: &Snapshot, show_offline: bool) -> Vec<Pair> {
-    if strip.kind == StripKind::Output {
+    if strip.kind.terminal() {
         return vec![];
     }
     let mut result = vec![];
@@ -22,7 +22,7 @@ fn pairs(strip: &Strip, snapshot: &Snapshot, show_offline: bool) -> Vec<Pair> {
             .filter(|s| s.kind == StripKind::Group),
     ) {
         let destination = match target.kind {
-            StripKind::Output => target
+            StripKind::Output | StripKind::VirtualMic => target
                 .output_key
                 .as_ref()
                 .map(|key| Destination::Output(key.clone())),
@@ -34,7 +34,7 @@ fn pairs(strip: &Strip, snapshot: &Snapshot, show_offline: bool) -> Vec<Pair> {
         let Some(destination) = destination else {
             continue;
         };
-        let offline = target
+        let offline = target.kind != StripKind::VirtualMic && target
             .output_key
             .as_ref()
             .is_some_and(|key| !snapshot.observation.outputs.iter().any(|o| &o.key == key));

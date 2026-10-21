@@ -92,6 +92,13 @@ impl App {
             rect.min + Vec2::new(4.0, 24.0),
             rect.max - Vec2::new(4.0, 40.0),
         );
+        let handle = ui.interact(
+            name_rect,
+            ui.id().with(("collapsed-strip-drag", strip.id)),
+            egui::Sense::click_and_drag(),
+        );
+        self.strip_drag_handle(&handle, strip);
+        self.strip_context_menu(&handle, strip);
         let galley =
             ui.painter()
                 .layout_no_wrap(strip.name.clone(), egui::FontId::proportional(13.0), DIM);
