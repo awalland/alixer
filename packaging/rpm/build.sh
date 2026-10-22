@@ -42,7 +42,7 @@ sed -e "s|@VERSION@|$version|g" -e "s|@LICENSE@|$licenses|g" \
     packaging/rpm/alixer.spec.in > "$top/SPECS/alixer.spec"
 tar --zstd -cf "$top/SOURCES/alixer-$version.tar.zst" \
     --transform="s|^|alixer-$version/|" --null -T <(rg --files --hidden -0 \
-        Cargo.toml Cargo.lock LICENSE README.md .gitignore crates integration tests packaging)
+        Cargo.toml Cargo.lock LICENSE README.md .gitignore crates integration tests packaging img)
 tar --zstd -C "$stage" -cf "$top/SOURCES/alixer-$version-vendor.tar.zst" \
     vendor vendor-config.toml third-party-licenses
 echo "Prepared sources and spec under $top"

@@ -3,7 +3,7 @@
 A Rust mixing console for Linux, powered by PipeWire and WirePlumber with an
 egui GUI.
 
-![Alixer mixing console](img/screenshot.jpg)
+![Alixer mixing console](img/screenshot.png)
 
 - Channel strips for microphones, playback applications, groups, aux masters, and outputs.
 - Per-channel routing, mute/solo, and pre/post-fader aux sends.
@@ -48,12 +48,69 @@ Stopping or crashing the service releases playback to normal desktop routing
 and removes its playback sinks. The virtual microphone stays silent on ordinary
 shutdown so recording applications do not fall back to a hardware microphone.
 
-To stop using Alixer, run `alixerctl undeploy`. It stops and disables the service,
-removes current and legacy virtual devices and managed routing metadata, removes
-per-user integration and output-name rules, and restarts WirePlumber. Desktop
-audio may briefly pause during that restart. The virtual microphone is removed
-too, so recording applications return to desktop policy. Saved mixer settings
-are retained; device volumes and unrelated user settings are left as they are.
+To remove Alixer's audio setup entirely, see [Removing Alixer's audio integration](#removing-alixers-audio-integration).
+
+## Signal flow
+
+PipeWire provides application streams, devices and connections. Alixer adds its
+own processing between application streams and output devices:
+
+```mermaid
+flowchart TD
+    App["Application<br/>Spotify, browser, etc."]
+    Stream["PipeWire application stream<br/>Volume controlled by desktop audio controls"]
+    Ingress["Alixer virtual playback sink"]
+    Mixer["Alixer mixer<br/>Inserts, faders, routing and auxes"]
+    Device["PipeWire output device<br/>Device volume controlled by<br/>Alixer or desktop audio controls"]
+    Physical["Physical output<br/>Speakers, headphones, interface"]
+
+    App --> Stream --> Ingress --> Mixer --> Device --> Physical
+```
+
+The application's stream volume and Alixer's playback fader are separate gain
+stages. Both affect the audio, but changing one does not move the other. Physical
+output faders control the same device volume as other desktop audio controls.
+
+Inside Alixer, inserts process audio **before the strip fader**. Routing selects
+which destinations receive each channel. Groups and aux masters have their own
+insert chains and faders:
+
+```mermaid
+flowchart TD
+    Input["Playback or microphone/input"]
+    Inserts["Strip inserts<br/>Effects run in chain order"]
+    Pre["Pre-fader tap<br/>After inserts"]
+    Fader["Strip fader"]
+    Post["Post-fader tap"]
+
+    Input --> Inserts --> Pre --> Fader --> Post
+
+    Pre -->|"Pre-fader aux send<br/>Independent send gain"| Aux
+    Post -->|"Post-fader aux send<br/>Independent send gain"| Aux
+
+    Post --> Routing["Main routing matrix"]
+    Routing -->|"Direct route"| Output
+    Routing -->|"Route through a group"| Group["Group strip<br/>Inserts → group fader"]
+    Group -->|"Group routing"| Output
+
+    Aux["Aux master strip<br/>Inserts → aux fader"]
+    Aux -->|"Aux routing"| Output
+
+    Output["Output strip inserts"]
+    Output --> Device["Device volume / mute"]
+    Device --> Physical["Physical output"]
+```
+
+- **Pre-fader aux:** includes the source's effects, but ignores its fader position.
+- **Post-fader aux:** includes those effects and follows the source fader.
+- **Aux master inserts:** process the combined audio from its sends, for example
+  a shared reverb.
+- **Output fader:** controls device volume, after output-strip inserts.
+
+Strip mute and solo also silence its pre-fader sends. Moving the strip fader
+changes the processed output level without changing the input level driving its
+compressor, gate or distortion. System sounds use separate paths to their
+requested devices, as described below.
 
 ## Using the console
 
@@ -170,7 +227,7 @@ controls. Meters show audio routed through Alixer before device volume and mute.
 ### Renaming outputs
 
 Rename an output in its inspector to set its display name across audio
-applications, including pavucontrol.
+applications and desktop audio controls.
 
 1. Enter the new name.
 2. Choose **Apply output names…**.
@@ -185,6 +242,37 @@ ALSA and Bluetooth outputs; custom virtual sinks must be renamed by their owner.
 Mixer state and GUI preferences are saved under `~/.local/state/alixer` (or
 `$XDG_STATE_HOME/alixer`). Use `ALIXER_STATE_DIR` for an isolated state directory.
 Restart the service after updating the binaries.
+
+## Removing Alixer's audio integration
+
+Close the GUI, then run this as your normal desktop user, without `sudo`:
+
+```sh
+alixerctl undeploy
+```
+
+This returns audio to normal desktop routing and:
+
+- Stops and disables the Alixer service, including a manually started daemon.
+- Removes Alixer's virtual playback devices, processing nodes and virtual
+  microphone.
+- Clears Alixer's routing metadata and default-device references to its devices.
+- Removes its per-user WirePlumber integration and output-name rules.
+- Reloads user service definitions and restarts WirePlumber to apply the cleanup.
+
+Audio may briefly pause while WirePlumber restarts. Applications using **Alixer
+Microphone** return to desktop recording policy; select the desired microphone
+in those applications afterward.
+
+Saved mixer settings and GUI preferences are retained. Current hardware device
+volumes and unrelated desktop settings are preserved; this does not restore a
+snapshot of the system from before Alixer was installed. The application binaries
+remain installed, so you can uninstall the package after running the command.
+
+Simply closing the GUI leaves the audio service running. Stopping the service
+returns playback to desktop routing, but retains the silent virtual microphone
+to prevent recording applications from unexpectedly switching to a hardware
+microphone. Use `undeploy` to remove that endpoint and the integration too.
 
 ## Development and verification
 

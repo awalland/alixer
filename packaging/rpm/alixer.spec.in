@@ -106,7 +106,7 @@ cp packaging/rpm/README.md RPM-PACKAGING.md
 
 %files
 %license LICENSE third-party-licenses
-%doc README.md RPM-PACKAGING.md
+%doc README.md RPM-PACKAGING.md img
 %{_bindir}/alixer
 %{_bindir}/alixerd
 %{_bindir}/alixerctl

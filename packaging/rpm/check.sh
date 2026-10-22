@@ -15,6 +15,7 @@ for file in usr/bin/alixer usr/bin/alixerd usr/bin/alixerctl \
     usr/share/applications/org.alixer.Alixer.desktop; do
     test -f "$extracted/$file"
 done
+test -f "$extracted/usr/share/doc/alixer/img/screenshot.png"
 ! test -e "$extracted/usr/share/wireplumber/wireplumber.conf.d/90-alixer.conf"
 grep -qx 'ExecStart="/usr/bin/alixerd"' "$extracted/usr/lib/systemd/user/alixer.service"
 desktop-file-validate "$extracted/usr/share/applications/org.alixer.Alixer.desktop"

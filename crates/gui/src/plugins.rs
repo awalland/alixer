@@ -139,7 +139,7 @@ impl App {
                                     [ui.available_width(), 23.0],
                                     egui::Button::selectable(
                                         self.selected_insert == Some((strip.id, insert.id)),
-                                        text,
+                                        (text, egui::Atom::grow()),
                                     )
                                     .truncate(),
                                 )
