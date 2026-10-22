@@ -213,6 +213,25 @@ impl Render {
         sample_rate: u32,
         metering: Arc<super::Metering>,
     ) -> Result<Self> {
+        Self::new_named(core, scene, suspended, sample_rate, metering, "alixer.engine")
+    }
+    /// An unrouted hardware input gets its own clock domain for UI previews.
+    pub fn new_preview(
+        core: &pw::core::CoreRc,
+        scene: &Scene,
+        sample_rate: u32,
+        metering: Arc<super::Metering>,
+    ) -> Result<Self> {
+        Self::new_named(core, scene, &BTreeSet::new(), sample_rate, metering, "alixer.preview")
+    }
+    fn new_named(
+        core: &pw::core::CoreRc,
+        scene: &Scene,
+        suspended: &BTreeSet<Id>,
+        sample_rate: u32,
+        metering: Arc<super::Metering>,
+        prefix: &str,
+    ) -> Result<Self> {
         let mut effective = scene.clone();
         for s in &mut effective.strips {
             if suspended.contains(&s.id) {
@@ -304,8 +323,8 @@ impl Render {
         events.version = 1;
         events.process = Some(process);
         let mut hook = Box::new(unsafe { std::mem::zeroed() });
-        let name = format!("alixer.engine.{}", Id::new_v4());
-        let props = properties! {"node.name"=>name.clone(),"node.description"=>"Alixer mixer","media.class"=>"Audio/Filter","node.autoconnect"=>"false","node.link-group"=>"alixer","audio.rate"=>"48000"};
+        let name = format!("{prefix}.{}", Id::new_v4());
+        let props = properties! {"node.name"=>name.clone(),"node.description"=>"Alixer mixer","media.class"=>"Audio/Filter","node.autoconnect"=>"false","node.link-group"=>name.clone(),"audio.rate"=>sample_rate.to_string()};
         let filter = unsafe {
             pw::sys::pw_filter_new(core.as_raw_ptr(), c"Alixer".as_ptr(), props.into_raw())
         };

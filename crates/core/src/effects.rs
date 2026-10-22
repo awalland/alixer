@@ -1,5 +1,7 @@
 //! The deliberately small set of effects offered by Alixer's insert picker.
 //! Unknown saved inserts remain playable and editable for backwards compatibility.
+pub const DEFAULT_EQ_Q: f32 = 4.0;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Effect {
     Equalizer,

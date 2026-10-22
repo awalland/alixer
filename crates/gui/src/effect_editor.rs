@@ -7,7 +7,7 @@ const GOLD: Color32 = Color32::from_rgb(238, 191, 113);
 fn number(port: &Value, key: &str, fallback: f32) -> f32 {
     port[key].as_f64().map(|n| n as f32).unwrap_or(fallback)
 }
-fn value(insert: &Insert, ports: &[Value], symbol: &str) -> f32 {
+pub(super) fn value(insert: &Insert, ports: &[Value], symbol: &str) -> f32 {
     insert.controls.get(symbol).copied().unwrap_or_else(|| {
         ports
             .iter()
@@ -90,149 +90,155 @@ impl App {
             .cloned();
         let effect = Effect::from_uri(&insert.uri);
         let mut open = true;
-        egui::Window::new(format!(
-            "{} · {}",
-            self.plugin_name(&insert.uri),
-            strip.name
-        ))
-        .id(egui::Id::new(("effect-editor", insert_id)))
-        .default_size(Vec2::new(820.0, 680.0))
-        .min_size(Vec2::new(560.0, 400.0))
-        .open(&mut open)
-        .resizable(true)
-        .show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(self.plugin_name(&insert.uri))
-                        .size(26.0)
-                        .color(MINT),
-                );
-                ui.label(
-                    RichText::new(format!(
-                        "{} · {}",
-                        strip.name,
-                        if strip.channels.len() == 1 {
-                            "MONO"
-                        } else {
-                            "STEREO"
-                        }
-                    ))
-                    .color(DIM),
-                );
-                let mut bypass = insert.bypass;
-                if ui.checkbox(&mut bypass, "Bypass").changed() {
-                    self.edit(Edit::BypassInsert {
-                        strip: strip_id,
-                        insert: insert_id,
-                        bypass,
-                    });
-                }
-            });
-            ui.separator();
-            let Some(plugin) = &plugin else {
-                ui.label("Effect metadata unavailable. Refresh the catalog to retry.");
-                if ui.button("Refresh plugin catalog").clicked() {
-                    self.send(Command::Plugins);
-                }
-                return;
-            };
-            let Some(ports) = plugin["ports"].as_array() else {
-                return;
-            };
-            egui::ScrollArea::vertical()
-                .id_salt(("editor-scroll", insert_id))
-                .show(ui, |ui| {
-                    if let Some(effect) = effect {
-                        if ports.iter().any(|p| p["symbol"] == "enabled")
-                            && value(insert, ports, "enabled") == 0.0
-                        {
-                            ui.horizontal(|ui| {
-                                ui.colored_label(
-                                    GOLD,
-                                    "Processing is disabled in this saved plugin.",
-                                );
-                                if ui.button("Enable processing").clicked() {
-                                    self.edit(Edit::SetControl {
-                                        strip: strip_id,
-                                        insert: insert_id,
-                                        symbol: "enabled".into(),
-                                        value: 1.0,
-                                    });
+        let screen = ctx.content_rect().shrink(8.0);
+        // max_size is the content size; leave room for the frame and title bar.
+        // This also clamps oversized sizes remembered from previous frames.
+        let max_size = (screen.size() - Vec2::new(16.0, 48.0)).max(Vec2::splat(1.0));
+        egui::Window::new(self.plugin_name(&insert.uri))
+            .id(egui::Id::new(("effect-editor", insert_id)))
+            .default_size(Vec2::new(680.0, 620.0).min(max_size))
+            .min_size(Vec2::new(340.0, 260.0).min(max_size))
+            .max_size(max_size)
+            .constrain_to(screen)
+            .open(&mut open)
+            .resizable(true)
+            .show(ctx, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new(self.plugin_name(&insert.uri))
+                            .size(26.0)
+                            .color(MINT),
+                    );
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(format!(
+                                "{} · {}",
+                                strip.name,
+                                if strip.channels.len() == 1 {
+                                    "MONO"
+                                } else {
+                                    "STEREO"
                                 }
-                            });
-                        }
-                        self.effect_meters(ui, snapshot, insert, effect);
-                        match effect {
-                            Effect::Equalizer => self.eq_editor(ui, strip_id, insert, ports),
-                            Effect::Compressor | Effect::Limiter => {
-                                self.dynamics_editor(ui, strip_id, insert, ports, snapshot, effect)
-                            }
-                        }
-                        // Keep newly added DSP parameters accessible after plugin upgrades.
-                        // Presentation-only and external-sidechain ports are intentionally omitted.
-                        let known = known_symbols(effect);
-                        let remaining: Vec<_> = ports
-                            .iter()
-                            .filter(|p| {
-                                let symbol = p["symbol"].as_str().unwrap_or_default();
-                                p["control"] == true
-                                    && p["input"] == true
-                                    && !housekeeping(symbol)
-                                    && !external_sidechain(symbol)
-                                    && !known.contains(&symbol)
-                                    && !(effect == Effect::Equalizer
-                                        && symbol.rsplit_once('_').is_some_and(
-                                            |(prefix, index)| {
-                                                index.parse::<usize>().is_ok()
-                                                    && [
-                                                        "ft", "fm", "s", "xs", "xm", "f", "w", "g",
-                                                        "q",
-                                                    ]
-                                                    .contains(&prefix)
-                                            },
-                                        ))
-                            })
-                            .collect();
-                        if !remaining.is_empty() {
-                            ui.collapsing("Additional processing controls", |ui| {
-                                for port in remaining {
-                                    self.effect_control(ui, strip_id, insert, ports, port);
-                                }
-                            });
-                        }
-                        if insert
-                            .controls
-                            .iter()
-                            .any(|(symbol, v)| external_sidechain(symbol) && *v != 0.0)
-                        {
-                            ui.colored_label(
-                                GOLD,
-                                "This saved effect uses an external sidechain or link mix.",
-                            );
-                            if ui.button("Use internal input").clicked() {
-                                for symbol in ["in2lk", "lk2in", "lk2sc", "sct", "extsc"] {
-                                    if ports.iter().any(|p| p["symbol"] == symbol) {
+                            ))
+                            .color(DIM),
+                        )
+                        .truncate(),
+                    )
+                    .on_hover_text(&strip.name);
+                    let mut bypass = insert.bypass;
+                    if ui.checkbox(&mut bypass, "Bypass").changed() {
+                        self.edit(Edit::BypassInsert {
+                            strip: strip_id,
+                            insert: insert_id,
+                            bypass,
+                        });
+                    }
+                });
+                ui.separator();
+                let Some(plugin) = &plugin else {
+                    ui.label("Effect metadata unavailable. Refresh the catalog to retry.");
+                    if ui.button("Refresh plugin catalog").clicked() {
+                        self.send(Command::Plugins);
+                    }
+                    return;
+                };
+                let Some(ports) = plugin["ports"].as_array() else {
+                    return;
+                };
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .id_salt(("editor-scroll", insert_id))
+                    .show(ui, |ui| {
+                        if let Some(effect) = effect {
+                            if ports.iter().any(|p| p["symbol"] == "enabled")
+                                && value(insert, ports, "enabled") == 0.0
+                            {
+                                ui.horizontal(|ui| {
+                                    ui.colored_label(
+                                        GOLD,
+                                        "Processing is disabled in this saved plugin.",
+                                    );
+                                    if ui.button("Enable processing").clicked() {
                                         self.edit(Edit::SetControl {
                                             strip: strip_id,
                                             insert: insert_id,
-                                            symbol: symbol.into(),
-                                            value: 0.0,
+                                            symbol: "enabled".into(),
+                                            value: 1.0,
                                         });
+                                    }
+                                });
+                            }
+                            self.effect_meters(ui, snapshot, insert, effect);
+                            match effect {
+                                Effect::Equalizer => self.eq_editor(ui, strip_id, insert, ports),
+                                Effect::Compressor | Effect::Limiter => self
+                                    .dynamics_editor(ui, strip_id, insert, ports, snapshot, effect),
+                            }
+                            // Keep newly added DSP parameters accessible after plugin upgrades.
+                            // Presentation-only and external-sidechain ports are intentionally omitted.
+                            let known = known_symbols(effect);
+                            let remaining: Vec<_> = ports
+                                .iter()
+                                .filter(|p| {
+                                    let symbol = p["symbol"].as_str().unwrap_or_default();
+                                    p["control"] == true
+                                        && p["input"] == true
+                                        && !housekeeping(symbol)
+                                        && !external_sidechain(symbol)
+                                        && !known.contains(&symbol)
+                                        && !(effect == Effect::Equalizer
+                                            && symbol.rsplit_once('_').is_some_and(
+                                                |(prefix, index)| {
+                                                    index.parse::<usize>().is_ok()
+                                                        && [
+                                                            "ft", "fm", "s", "xs", "xm", "f", "w",
+                                                            "g", "q",
+                                                        ]
+                                                        .contains(&prefix)
+                                                },
+                                            ))
+                                })
+                                .collect();
+                            if !remaining.is_empty() {
+                                ui.collapsing("Additional processing controls", |ui| {
+                                    for port in remaining {
+                                        self.effect_control(ui, strip_id, insert, ports, port);
+                                    }
+                                });
+                            }
+                            if insert
+                                .controls
+                                .iter()
+                                .any(|(symbol, v)| external_sidechain(symbol) && *v != 0.0)
+                            {
+                                ui.colored_label(
+                                    GOLD,
+                                    "This saved effect uses an external sidechain or link mix.",
+                                );
+                                if ui.button("Use internal input").clicked() {
+                                    for symbol in ["in2lk", "lk2in", "lk2sc", "sct", "extsc"] {
+                                        if ports.iter().any(|p| p["symbol"] == symbol) {
+                                            self.edit(Edit::SetControl {
+                                                strip: strip_id,
+                                                insert: insert_id,
+                                                symbol: symbol.into(),
+                                                value: 0.0,
+                                            });
+                                        }
                                     }
                                 }
                             }
+                        } else {
+                            ui.label(RichText::new("Legacy insert · generic controls").color(DIM));
+                            for port in ports
+                                .iter()
+                                .filter(|p| p["control"] == true && p["input"] == true)
+                            {
+                                self.effect_control(ui, strip_id, insert, ports, port);
+                            }
                         }
-                    } else {
-                        ui.label(RichText::new("Legacy insert · generic controls").color(DIM));
-                        for port in ports
-                            .iter()
-                            .filter(|p| p["control"] == true && p["input"] == true)
-                        {
-                            self.effect_control(ui, strip_id, insert, ports, port);
-                        }
-                    }
-                });
-        });
+                    });
+            });
         if !open {
             self.selected_insert = None;
         }
@@ -282,7 +288,7 @@ impl App {
             .ctx()
             .data_mut(|d| d.get_temp::<usize>(key).unwrap_or(0))
             .min(groups.len() - 1);
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             for (index, (title, _)) in groups.iter().enumerate() {
                 if ui.selectable_label(tab == index, *title).clicked() {
                     tab = index;
@@ -308,7 +314,11 @@ impl App {
             .inner_margin(12.0)
             .show(ui, |ui| {
                 ui.set_min_width((width - 26.0).max(0.0));
-                ui.spacing_mut().slider_width = (width - 390.0).clamp(100.0, 360.0);
+                ui.spacing_mut().slider_width = if width < 520.0 {
+                    (width - 130.0).clamp(40.0, 360.0)
+                } else {
+                    (width - 360.0).clamp(100.0, 360.0)
+                };
                 ui.label(RichText::new(title).size(17.0).color(MINT));
                 for symbol in symbols {
                     if let Some(port) = ports.iter().find(|p| p["symbol"] == *symbol) {
@@ -352,94 +362,123 @@ impl App {
         let lo = display_value(min, in_db);
         let hi = display_value(max, in_db);
         let mut changed = false;
-        ui.horizontal(|ui| {
-            ui.push_id((insert.id, symbol), |ui| {
-                ui.allocate_ui_with_layout(
-                    Vec2::new(250.0, 20.0),
-                    egui::Layout::left_to_right(egui::Align::Center),
-                    |ui| {
+        let stacked = ui.available_width() < 520.0;
+        let layout = if stacked {
+            egui::Layout::top_down(egui::Align::Min)
+        } else {
+            egui::Layout::left_to_right(egui::Align::Center)
+        };
+        // with_layout inherits the entire remaining height. Centering a row in
+        // that space pushed controls down as the editor grew taller. Start with
+        // one interaction-height row and let wrapped labels grow it as needed.
+        ui.allocate_ui_with_layout(
+            Vec2::new(ui.available_width(), ui.spacing().interact_size.y),
+            layout,
+            |ui| {
+                ui.push_id((insert.id, symbol), |ui| {
+                    if stacked {
                         ui.add(egui::Label::new(name).wrap());
-                    },
-                );
-                if port["toggle"] == true {
-                    let mut on = raw > 0.0;
-                    changed = ui.checkbox(&mut on, "").changed();
-                    shown = if on { 1.0 } else { 0.0 };
-                } else if let Some(choices) = port["choices"].as_array().filter(|c| !c.is_empty()) {
-                    let current = choices
-                        .iter()
-                        .find(|c| c[0].as_f64().is_some_and(|v| (v as f32 - raw).abs() < 0.01))
-                        .and_then(|c| c[1].as_str())
-                        .map(str::to_owned)
-                        .unwrap_or_else(|| format!("{raw}"));
-                    egui::ComboBox::from_id_salt("choice")
-                        .selected_text(current)
-                        .width(220.0)
-                        .show_ui(ui, |ui| {
-                            for choice in choices {
-                                if let (Some(v), Some(label)) =
-                                    (choice[0].as_f64(), choice[1].as_str())
-                                {
-                                    if ui
-                                        .selectable_label((v as f32 - raw).abs() < 0.01, label)
-                                        .clicked()
+                    } else {
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(220.0, 20.0),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                ui.add(egui::Label::new(name).wrap());
+                            },
+                        );
+                    }
+                    if port["toggle"] == true {
+                        let mut on = raw > 0.0;
+                        changed = ui.checkbox(&mut on, "").changed();
+                        shown = if on { 1.0 } else { 0.0 };
+                    } else if let Some(choices) =
+                        port["choices"].as_array().filter(|c| !c.is_empty())
+                    {
+                        let current = choices
+                            .iter()
+                            .find(|c| c[0].as_f64().is_some_and(|v| (v as f32 - raw).abs() < 0.01))
+                            .and_then(|c| c[1].as_str())
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| format!("{raw}"));
+                        egui::ComboBox::from_id_salt("choice")
+                            .selected_text(current)
+                            .width(ui.available_width().min(220.0))
+                            .truncate()
+                            .show_ui(ui, |ui| {
+                                for choice in choices {
+                                    if let (Some(v), Some(label)) =
+                                        (choice[0].as_f64(), choice[1].as_str())
                                     {
-                                        shown = v as f32;
-                                        changed = true;
+                                        if ui
+                                            .selectable_label((v as f32 - raw).abs() < 0.01, label)
+                                            .clicked()
+                                        {
+                                            shown = v as f32;
+                                            changed = true;
+                                        }
                                     }
                                 }
-                            }
-                        });
-                } else {
-                    let mut slider = egui::Slider::new(&mut shown, lo..=hi)
-                        .logarithmic(
-                            !in_db
-                                && unit != "%"
-                                && (port["logarithmic"] == true
-                                    || (Effect::from_uri(&insert.uri) == Some(Effect::Equalizer)
-                                        && symbol.starts_with("q_"))),
-                        )
-                        .smallest_positive(if min > 0.0 { min as f64 } else { 0.01 })
-                        .suffix(if in_db {
-                            " dB".to_owned()
-                        } else if unit.is_empty() {
-                            String::new()
-                        } else {
-                            format!(" {unit}")
-                        });
-                    if in_db {
-                        let has_silence = min == 0.0;
-                        slider = slider
-                            .custom_formatter(move |v, _| {
-                                if has_silence && v <= -100.0 {
-                                    "−∞".into()
-                                } else {
-                                    format!("{v:.2}")
-                                }
-                            })
-                            .custom_parser(move |text| {
-                                if has_silence && ["−∞", "-inf", "-infinity"].contains(&text.trim())
-                                {
-                                    Some(-100.0)
-                                } else {
-                                    text.parse().ok()
-                                }
                             });
+                    } else {
+                        let mut slider = egui::Slider::new(&mut shown, lo..=hi)
+                            .logarithmic(
+                                !in_db
+                                    && unit != "%"
+                                    && (port["logarithmic"] == true
+                                        || (Effect::from_uri(&insert.uri)
+                                            == Some(Effect::Equalizer)
+                                            && symbol.starts_with("q_"))),
+                            )
+                            .smallest_positive(if min > 0.0 { min as f64 } else { 0.01 })
+                            .suffix(if in_db {
+                                " dB".to_owned()
+                            } else if unit.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" {unit}")
+                            });
+                        if in_db {
+                            let has_silence = min == 0.0;
+                            slider = slider
+                                .custom_formatter(move |v, _| {
+                                    if has_silence && v <= -100.0 {
+                                        "−∞".into()
+                                    } else {
+                                        format!("{v:.2}")
+                                    }
+                                })
+                                .custom_parser(move |text| {
+                                    if has_silence
+                                        && ["−∞", "-inf", "-infinity"].contains(&text.trim())
+                                    {
+                                        Some(-100.0)
+                                    } else {
+                                        text.parse().ok()
+                                    }
+                                });
+                        }
+                        if port["integer"] == true && !in_db {
+                            slider = slider.integer();
+                        }
+                        let response = ui.add(slider).on_hover_text(
+                            "Drag to adjust · click the number to type · double-click to reset",
+                        );
+                        changed = response.changed();
+                        if response.double_clicked() {
+                            let default = if Effect::from_uri(&insert.uri) == Some(Effect::Equalizer)
+                                && symbol.starts_with("q_")
+                            {
+                                alixer_core::effects::DEFAULT_EQ_Q
+                            } else {
+                                number(port, "default", 0.0)
+                            };
+                            shown = display_value(default, in_db);
+                            changed = true;
+                        }
                     }
-                    if port["integer"] == true && !in_db {
-                        slider = slider.integer();
-                    }
-                    let response = ui.add(slider).on_hover_text(
-                        "Drag to adjust · click the number to type · double-click to reset",
-                    );
-                    changed = response.changed();
-                    if response.double_clicked() {
-                        shown = display_value(number(port, "default", 0.0), in_db);
-                        changed = true;
-                    }
-                }
-            });
-        });
+                });
+            },
+        );
         if changed {
             self.edit(Edit::SetControl {
                 strip,
@@ -455,8 +494,12 @@ impl App {
             .ctx()
             .data_mut(|d| d.get_temp::<usize>(selection).unwrap_or(0));
         ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("BAND FREQUENCY / GAIN").small().color(DIM));
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                RichText::new("APPROXIMATE FILTER RESPONSE")
+                    .small()
+                    .color(DIM),
+            );
             ui.label("Drag a band · scroll over it to adjust Q");
         });
         let (outer, _) =
@@ -510,6 +553,7 @@ impl App {
                 DIM,
             );
         }
+        eq_curve::draw(ui, plot, insert, ports, selected);
         for band in 0..8 {
             let f = format!("f_{band}");
             let g = format!("g_{band}");
@@ -624,7 +668,7 @@ impl App {
             "Signal & processing",
             &["g_in", "g_out", "bal", "frqs", "mode", "decramp"],
         );
-        ui.label(RichText::new("The graph positions bands by frequency and gain; it does not depict the combined filter response.").small().color(DIM));
+        ui.label(RichText::new("Approximate response · mint: combined · gold: selected band. LSP algorithms and decramping may differ.").small().color(DIM));
     }
     fn effect_meters(
         &self,
@@ -633,95 +677,118 @@ impl App {
         insert: &Insert,
         effect: Effect,
     ) {
-        let meters: Vec<_> = snapshot
-            .plugin_meters
-            .iter()
-            .filter(|(id, _, _)| *id == insert.id)
-            .collect();
-        if insert.bypass {
-            ui.label(RichText::new("BYPASSED").color(GOLD));
-            return;
-        }
-        if meters.is_empty() {
-            ui.label(
-                RichText::new(
-                    if snapshot.status.starts_with("Offline")
-                        || snapshot.status.starts_with("Disconnected")
-                    {
-                        "Effect meters unavailable while audio is offline."
-                    } else {
-                        "Waiting for live effect meters…"
-                    },
-                )
-                .color(DIM),
-            );
-            return;
-        }
-        let width = ((ui.available_width() - 24.0)
-            / if effect == Effect::Equalizer {
-                2.0
-            } else {
-                3.0
-            })
-        .max(110.0);
-        ui.horizontal(|ui| {
-            for (label, prefixes, reduction) in match effect {
-                Effect::Equalizer => vec![
-                    ("INPUT", vec!["im", "iml", "imr"], false),
-                    ("OUTPUT", vec!["sm", "sml", "smr"], false),
-                ],
-                Effect::Compressor => vec![
-                    ("INPUT", vec!["ilm", "ilm_l", "ilm_r"], false),
-                    ("OUTPUT", vec!["olm", "olm_l", "olm_r"], false),
-                    ("GAIN CHANGE", vec!["rlm", "rlm_l", "rlm_r"], true),
-                ],
-                Effect::Limiter => vec![
-                    ("INPUT", vec!["ilm", "ilm_l", "ilm_r"], false),
-                    ("OUTPUT", vec!["olm", "olm_l", "olm_r"], false),
-                    ("REDUCTION", vec!["grlm", "grlm_l", "grlm_r"], true),
-                ],
-            } {
-                let values: Vec<_> = meters
+        ui.allocate_ui_with_layout(
+            Vec2::new(ui.available_width(), 76.0),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                ui.set_min_height(76.0);
+                let meters: Vec<_> = snapshot
+                    .plugin_meters
                     .iter()
-                    .filter(|(_, symbol, _)| prefixes.contains(&symbol.as_str()))
-                    .map(|(_, _, v)| *v)
+                    .filter(|(id, _, _)| *id == insert.id)
                     .collect();
-                if values.is_empty() {
-                    continue;
+                if insert.bypass {
+                    ui.label(RichText::new("BYPASSED").color(GOLD));
+                    return;
                 }
-                let level = if reduction {
-                    values.into_iter().fold(f32::INFINITY, f32::min)
-                } else {
-                    values.into_iter().fold(0.0_f32, f32::max)
-                };
-                let level_db = db(level);
-                let text = if level <= 0.0 {
-                    "−∞ dB".into()
-                } else if reduction {
-                    format!("{:+.1} dB", level_db)
-                } else {
-                    format!("{:.1} dBFS", level_db)
-                };
-                ui.allocate_ui(Vec2::new(width, 60.0), |ui| {
-                    ui.label(RichText::new(label).small().color(DIM));
-                    ui.label(RichText::new(text).size(21.0).color(if reduction {
-                        GOLD
-                    } else {
-                        MINT
-                    }));
-                    let fraction = if reduction {
-                        (-level_db / 36.0).clamp(0.0, 1.0)
-                    } else {
-                        ((level_db + 60.0) / 60.0).clamp(0.0, 1.0)
-                    };
-                    ui.add(
-                        egui::ProgressBar::new(fraction)
-                            .desired_width(width)
-                            .fill(if reduction { GOLD } else { MINT }),
+                if meters.is_empty() {
+                    ui.label(
+                        RichText::new(
+                            if snapshot.status.starts_with("Offline")
+                                || snapshot.status.starts_with("Disconnected")
+                            {
+                                "Effect meters unavailable while audio is offline."
+                            } else {
+                                "Waiting for live effect meters…"
+                            },
+                        )
+                        .color(DIM),
                     );
+                    return;
+                }
+                let count = if effect == Effect::Equalizer {
+                    2.0
+                } else {
+                    3.0
+                };
+                let width = ((ui.available_width() - (count - 1.0) * ui.spacing().item_spacing.x)
+                    / count)
+                    .max(1.0);
+                ui.horizontal(|ui| {
+                    for (label, prefixes, reduction) in match effect {
+                        Effect::Equalizer => vec![
+                            ("INPUT", vec!["im", "iml", "imr"], false),
+                            ("OUTPUT", vec!["sm", "sml", "smr"], false),
+                        ],
+                        Effect::Compressor => vec![
+                            ("INPUT", vec!["ilm", "ilm_l", "ilm_r"], false),
+                            ("OUTPUT", vec!["olm", "olm_l", "olm_r"], false),
+                            ("GAIN CHANGE", vec!["rlm", "rlm_l", "rlm_r"], true),
+                        ],
+                        Effect::Limiter => vec![
+                            ("INPUT", vec!["ilm", "ilm_l", "ilm_r"], false),
+                            ("OUTPUT", vec!["olm", "olm_l", "olm_r"], false),
+                            ("REDUCTION", vec!["grlm", "grlm_l", "grlm_r"], true),
+                        ],
+                    } {
+                        let values: Vec<_> = meters
+                            .iter()
+                            .filter(|(_, symbol, _)| prefixes.contains(&symbol.as_str()))
+                            .map(|(_, _, v)| *v)
+                            .collect();
+                        if values.is_empty() {
+                            continue;
+                        }
+                        let level = if reduction {
+                            values.into_iter().fold(f32::INFINITY, f32::min)
+                        } else {
+                            values.into_iter().fold(0.0_f32, f32::max)
+                        };
+                        let level_db = db(level);
+                        let text = if level <= 0.0 {
+                            "−∞ dB".into()
+                        } else if reduction {
+                            format!("{:+.1} dB", level_db)
+                        } else {
+                            format!("{:.1} dBFS", level_db)
+                        };
+                        // The parent is horizontal: explicitly stack meter contents.
+                        // Inheriting that layout added text widths to the bar width on
+                        // every frame, growing the window with each numeric readout.
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(width, 76.0),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                ui.add(
+                                    egui::Label::new(RichText::new(label).small().color(DIM))
+                                        .truncate(),
+                                );
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(text).size(21.0).color(if reduction {
+                                            GOLD
+                                        } else {
+                                            MINT
+                                        }),
+                                    )
+                                    .truncate(),
+                                );
+                                let fraction = if reduction {
+                                    (-level_db / 36.0).clamp(0.0, 1.0)
+                                } else {
+                                    ((level_db + 60.0) / 60.0).clamp(0.0, 1.0)
+                                };
+                                ui.add(
+                                    egui::ProgressBar::new(fraction)
+                                        .desired_width(width)
+                                        .fill(if reduction { GOLD } else { MINT }),
+                                );
+                            },
+                        );
+                    }
                 });
-            }
-        });
+            },
+        );
     }
 }
 fn known_symbols(effect: Effect) -> &'static [&'static str] {
@@ -846,6 +913,7 @@ mod tests {
         labels: Vec<(String, egui::Rect)>,
         handles: Vec<egui::Pos2>,
         time: f64,
+        screen_size: Vec2,
     }
     impl Harness {
         fn new(plugin: Value, channels: usize) -> Self {
@@ -883,6 +951,7 @@ mod tests {
                 labels: vec![],
                 handles: vec![],
                 time: 0.0,
+                screen_size: Vec2::new(1200.0, 900.0),
             };
             for _ in 0..4 {
                 h.frame(vec![]);
@@ -897,7 +966,7 @@ mod tests {
                     time: Some(self.time),
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
-                        Vec2::new(1200.0, 900.0),
+                        self.screen_size,
                     )),
                     ..Default::default()
                 },
@@ -982,6 +1051,170 @@ mod tests {
         assert!(
             matches!(h.commands.try_recv().unwrap(), Command::Edit(Edit::SetControl {symbol,value,..}) if symbol == "cm" && value == 2.0)
         );
+    }
+    fn layout_plugin(effect: Effect) -> Value {
+        let mut ports = vec![];
+        for band in 0..8 {
+            for (prefix, default, min, max) in [
+                ("f", 100.0 * (band + 1) as f32, 10.0, 24000.0),
+                ("g", 1.0, 0.01585, 63.09575),
+                ("ft", 1.0, 0.0, 11.0),
+            ] {
+                ports.push(serde_json::json!({"symbol":format!("{prefix}_{band}"),"name":prefix,"default":default,"min":min,"max":max,"control":true,"input":true}));
+            }
+        }
+        serde_json::json!({"uri":effect.uri(2).unwrap(),"name":effect.name(),"ports":ports})
+    }
+    #[test]
+    fn signal_levels_do_not_resize_windows_or_move_eq_handles() {
+        for effect in Effect::ALL {
+            let mut h = Harness::new(layout_plugin(effect), 2);
+            let insert = h.snapshot.scene.strips[0].inserts[0].id;
+            let id = egui::Id::new(("effect-editor", insert));
+            let symbols = match effect {
+                Effect::Equalizer => ["iml", "sml", "unused"],
+                Effect::Compressor => ["ilm_l", "olm_l", "rlm_l"],
+                Effect::Limiter => ["ilm_l", "olm_l", "grlm_l"],
+            };
+            let empty_bounds = h.ctx.memory(|m| m.area_rect(id)).unwrap();
+            let empty_handles = h.handles.clone();
+            h.snapshot.plugin_meters = symbols
+                .iter()
+                .map(|s| (insert, s.to_string(), 0.5))
+                .collect();
+            for _ in 0..8 {
+                h.frame(vec![]);
+            }
+            let bounds = h.ctx.memory(|m| m.area_rect(id)).unwrap();
+            assert!(
+                bounds.width() < 900.0,
+                "{effect:?} window grew to {bounds:?}"
+            );
+            assert_eq!(
+                bounds, empty_bounds,
+                "Meter availability resized {effect:?}"
+            );
+            assert_eq!(
+                h.handles, empty_handles,
+                "Meter availability moved EQ handles"
+            );
+            let handles = h.handles.clone();
+            for level in [0.0, 1e-6, 0.01, 1.0, 10.0, 1000.0] {
+                for (_, _, value) in &mut h.snapshot.plugin_meters {
+                    *value = level;
+                }
+                for _ in 0..3 {
+                    h.frame(vec![]);
+                }
+                let next = h.ctx.memory(|m| m.area_rect(id)).unwrap();
+                assert!(
+                    (next.width() - bounds.width()).abs() < 0.1
+                        && (next.height() - bounds.height()).abs() < 0.1,
+                    "{effect:?} resized with level {level}: {bounds:?} -> {next:?}"
+                );
+                assert_eq!(
+                    h.handles, handles,
+                    "EQ handles moved with input level {level}"
+                );
+            }
+        }
+    }
+    #[test]
+    fn editor_fits_a_small_viewport_and_recovers_after_viewport_shrink() {
+        for effect in Effect::ALL {
+            let mut h = Harness::new(layout_plugin(effect), 2);
+            h.snapshot.scene.strips[0].name = "A very long desktop application name ".repeat(12);
+            for size in [Vec2::new(480.0, 600.0), Vec2::new(340.0, 480.0)] {
+                h.screen_size = size;
+                for _ in 0..6 {
+                    h.frame(vec![]);
+                }
+                let insert = h.snapshot.scene.strips[0].inserts[0].id;
+                let bounds = h
+                    .ctx
+                    .memory(|m| m.area_rect(egui::Id::new(("effect-editor", insert))))
+                    .unwrap();
+                assert!(
+                    bounds.min.x >= 0.0
+                        && bounds.max.x <= size.x
+                        && bounds.min.y >= 0.0
+                        && bounds.max.y <= size.y,
+                    "{effect:?} outside {size:?} viewport: {bounds:?}"
+                );
+            }
+        }
+    }
+    #[test]
+    fn control_rows_stay_compact_when_available_height_increases() {
+        let (mut app, _) = test_app();
+        let ctx = egui::Context::default();
+        let strip = Id::new_v4();
+        let insert = Insert {
+            id: Id::new_v4(),
+            uri: Effect::Compressor.uri(2).unwrap(),
+            bypass: false,
+            controls: BTreeMap::new(),
+            state: None,
+        };
+        let ports = vec![
+            serde_json::json!({"symbol":"cm", "name":"Compression mode", "control":true,"input":true,"default":0,"min":0,"max":2,"choices":[[0,"Downward"],[2,"Boosting"]]}),
+            serde_json::json!({"symbol":"at", "name":"Attack time", "control":true,"input":true,"default":20,"min":0,"max":2000}),
+        ];
+        for width in [300.0, 640.0] {
+            let mut previous: Option<Vec<f32>> = None;
+            for height in [400.0, 1200.0] {
+                let mut positions = vec![];
+                for _ in 0..3 {
+                    let mut output = ctx.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                Vec2::new(800.0, height),
+                            )),
+                            ..Default::default()
+                        },
+                        |ui| {
+                            ui.set_width(width);
+                            app.control_section(
+                                ui,
+                                strip,
+                                &insert,
+                                &ports,
+                                "Controls",
+                                &["cm", "at"],
+                            );
+                        },
+                    );
+                    positions = ["Controls", "Compression mode", "Attack time"]
+                        .iter()
+                        .map(|label| {
+                            output
+                                .shapes
+                                .iter()
+                                .find_map(|s| match &s.shape {
+                                    egui::Shape::Text(t) if t.galley.text() == *label => {
+                                        Some(t.pos.y)
+                                    }
+                                    _ => None,
+                                })
+                                .unwrap()
+                        })
+                        .collect();
+                    output.textures_delta.clear();
+                }
+                assert!(
+                    positions[1] - positions[0] < 40.0 && positions[2] - positions[1] < 70.0,
+                    "Rows stretched at {width} × {height}: {positions:?}"
+                );
+                if let Some(previous) = previous {
+                    assert_eq!(
+                        positions, previous,
+                        "Control positions changed with available height"
+                    );
+                }
+                previous = Some(positions);
+            }
+        }
     }
     #[test]
     fn installed_effect_editors_render_and_eq_drag_edits_the_correct_parameters() {

@@ -1,6 +1,7 @@
 mod aux_sends;
 mod dev_service;
 mod effect_editor;
+mod eq_curve;
 mod fader;
 #[cfg(test)]
 mod ipc_tests;

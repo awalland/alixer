@@ -455,9 +455,13 @@ impl Scene {
             Edit::RemoveRoute { route } => self.routes.retain(|r| r.id != route),
             Edit::AddInsert { strip, uri } => self.strip_mut(strip)?.inserts.push(Insert {
                 id: Id::new_v4(),
+                controls: if effects::Effect::from_uri(&uri) == Some(effects::Effect::Equalizer) {
+                    (0..8).map(|band| (format!("q_{band}"), effects::DEFAULT_EQ_Q)).collect()
+                } else {
+                    BTreeMap::new()
+                },
                 uri,
                 bypass: false,
-                controls: BTreeMap::new(),
                 state: None,
             }),
             Edit::RemoveInsert { strip, insert } => {

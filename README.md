@@ -39,7 +39,13 @@ the GUI connects to the independently running service.
 The service keeps audio running when the GUI closes. Its PipeWire graph sleeps
 when no playback or connected, routed microphone inputs need processing. Metering
 runs for GUI subscribers and explicit snapshot requests; unrouted microphone
-preview connections are released when metering stops.
+preview connections are released when metering stops. Unrouted inputs use separate
+preview filters, so opening or closing the GUI does not attach their capture
+clocks to playback.
+Playback sinks exist only while an application stream needs them, including while
+paused. Saved strips keep their settings without leaving unused output devices.
+Connected sinks survive service restarts; unused current and legacy sinks are
+collected automatically.
 
 ## Using the console
 
@@ -109,7 +115,10 @@ Each strip has an insert rack above its buttons and fader.
   be typed directly; double-click a slider to restore its default.
 - **EQ:** select one of eight bands, drag its frequency/gain handle, and scroll
   over a handle to adjust Q. Filter type, algorithm, slope, width, solo and mute
-  remain available. The plot shows band positions, not a simulated frequency response.
+  remain available. The plot shows an approximate filter response: mint for the combined curve and
+  gold for the selected band. Q changes the curve width; muted/off bands are excluded.
+  The preview uses common analog filter prototypes, so LSP algorithms and decramping
+  may differ. Ladder filters are omitted from the preview.
 - **Dynamics:** processing, timing, detector and signal controls are grouped by
   function, with live input/output meters and gain-change history.
 - **Manage:** right-click an insert to bypass, reorder, or remove it.

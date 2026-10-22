@@ -14,7 +14,7 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 #[derive(Clone, Debug)]
@@ -93,16 +93,70 @@ pub struct Update {
 pub struct Metering {
     pub subscribers: AtomicUsize,
     requested: AtomicBool,
+    polling: AtomicBool,
 }
 impl Metering {
     pub fn request(&self) {
         self.requested.store(true, Ordering::Relaxed);
     }
     pub fn enabled(&self) -> bool {
-        self.subscribers.load(Ordering::Relaxed) > 0 || self.requested.load(Ordering::Relaxed)
+        self.subscribers.load(Ordering::Relaxed) > 0
+            || self.requested.load(Ordering::Relaxed)
+            || self.polling.load(Ordering::Relaxed)
     }
-    fn clear_request(&self) {
-        self.requested.store(false, Ordering::Relaxed);
+    /// Only the control thread reads the clock. Keep preview links and RT meters
+    /// enabled between GUI polls, including normal IPC/scheduler jitter. A single
+    /// CLI snapshot still releases preview links after this short grace period.
+    fn refresh_polling(&self, last_request: &mut Option<Instant>, now: Instant) {
+        if self.requested.swap(false, Ordering::Relaxed) {
+            *last_request = Some(now);
+        }
+        self.polling.store(
+            last_request.is_some_and(|last| now.duration_since(last) < Duration::from_secs(1)),
+            Ordering::Relaxed,
+        );
+    }
+}
+
+#[cfg(test)]
+mod metering_tests {
+    use super::*;
+
+    #[test]
+    fn polling_keeps_metering_enabled_between_requests_and_expires_afterwards() {
+        let metering = Metering::default();
+        let start = Instant::now();
+        let mut last = None;
+        assert!(!metering.enabled());
+        for tick in 0..30 {
+            // Poll every 200 ms against the 100 ms controller timer. Previously
+            // every other tick disconnected the preview's audio links.
+            if tick % 2 == 0 {
+                metering.request();
+            }
+            metering.refresh_polling(&mut last, start + Duration::from_millis(tick * 100));
+            assert!(metering.enabled(), "metering interrupted at tick {tick}");
+        }
+        metering.refresh_polling(&mut last, start + Duration::from_secs(4));
+        assert!(!metering.enabled(), "closed clients must release preview inputs");
+    }
+
+    #[test]
+    fn subscriptions_and_new_requests_survive_polling_expiry() {
+        let metering = Metering::default();
+        let start = Instant::now();
+        let mut last = None;
+        metering.subscribers.store(1, Ordering::Relaxed);
+        metering.refresh_polling(&mut last, start);
+        assert!(metering.enabled());
+        metering.subscribers.store(0, Ordering::Relaxed);
+        assert!(!metering.enabled());
+        // A request arriving after the timer's refresh remains pending, rather
+        // than being erased at the end of that timer callback.
+        metering.request();
+        assert!(metering.enabled());
+        metering.refresh_polling(&mut last, start + Duration::from_secs(1));
+        assert!(metering.enabled());
     }
 }
 pub struct Backend {
@@ -163,6 +217,8 @@ impl Drop for Backend {
 struct Raw {
     kind: String,
     props: BTreeMap<String, String>,
+    running: bool,
+    idle_after: Option<Instant>,
     volume: f32,
     mute: bool,
     channel_volumes: Vec<f32>,
@@ -176,6 +232,45 @@ struct Graph {
     targets: BTreeMap<u32, String>,
 }
 impl Graph {
+    fn expire_activity(&mut self, now: Instant) {
+        for node in self.objects.values_mut() {
+            if node.idle_after.is_some_and(|deadline| now >= deadline) {
+                node.idle_after = None;
+                self.dirty = true;
+            }
+        }
+    }
+    /// A retained ingress may outlive its application, or contain a paused
+    /// stream. Its monitor must not drive the mixer just because it still exists.
+    fn has_running_source(&self, target: u32) -> bool {
+        self.objects.values().any(|link| {
+            link.kind == "Link"
+                && link.props.get("link.input.node").and_then(|s| s.parse::<u32>().ok()) == Some(target)
+                && link.props.get("link.output.node").and_then(|s| s.parse::<u32>().ok())
+                    .and_then(|source| self.objects.get(&source))
+                    .is_some_and(|source| source.running || source.idle_after.is_some())
+        })
+    }
+    /// Paused streams still own their sink. Only collect endpoints with no
+    /// incoming links, independently of the nodes' running/suspended state.
+    fn has_incoming_link(&self, target: u32) -> bool {
+        self.objects.values().any(|link| {
+            link.kind == "Link"
+                && link.props.get("link.input.node").and_then(|s| s.parse::<u32>().ok())
+                    == Some(target)
+        })
+    }
+    fn unused_playback_ingresses(&self, needed: &BTreeSet<String>) -> Vec<(u32, String)> {
+        self.objects.iter().filter_map(|(&id, node)| {
+            let name = node.props.get("node.name")?;
+            (node.kind == "Node"
+                && node.props.get("media.class").map(String::as_str) == Some("Audio/Sink")
+                && (name.starts_with("alixer.input.") || name.starts_with("lixer.input."))
+                && !needed.contains(name)
+                && !self.has_incoming_link(id))
+                .then(|| (id, name.clone()))
+        }).collect()
+    }
     fn has_link(&self, source: u32, target: u32) -> bool {
         self.objects.values().any(|o| {
             o.kind == "Link"
@@ -385,6 +480,77 @@ impl Graph {
         result
     }
 }
+struct Preview {
+    render: render::Render,
+    signature: String,
+    rate: u32,
+}
+
+fn disconnect_filter(graph: &Graph, links: &mut BTreeMap<(u32, u32), pw::link::Link>, name: &str) {
+    let ports: BTreeSet<_> = graph.objects.iter()
+        .filter(|(_, node)| node.kind == "Node" && node.props.get("node.name").is_some_and(|n| n == name))
+        .flat_map(|(&id, _)| graph.ports(id, true).into_iter().chain(graph.ports(id, false)))
+        .map(|port| port.0).collect();
+    links.retain(|(source, target), _| !ports.contains(source) && !ports.contains(target));
+}
+
+/// Preview filters have no outputs and no shared link group with playback or
+/// each other. Opening meters must never merge capture clocks into playback.
+fn sync_previews(
+    core: &pw::core::CoreRc,
+    graph: &Graph,
+    apply: &Apply,
+    metering: &Arc<Metering>,
+    previews: &mut BTreeMap<Id, Preview>,
+    links: &mut BTreeMap<(u32, u32), pw::link::Link>,
+    linked: &mut BTreeSet<(u32, u32)>,
+) -> Result<()> {
+    let wanted: BTreeSet<_> = apply.scene.strips.iter().filter(|s| {
+        metering.enabled() && s.kind == StripKind::Input && !apply.suspended.contains(&s.id)
+            && !apply.scene.routes.iter().any(|r| r.source == s.id)
+            && s.input_key.as_ref().is_some_and(|key| graph.objects.values().any(|node|
+                node.kind == "Node" && node.props.get("node.name") == Some(key)))
+    }).map(|s| s.id).collect();
+    previews.retain(|id, preview| {
+        if wanted.contains(id) { return true; }
+        disconnect_filter(graph, links, &preview.render.name);
+        false
+    });
+    for strip in apply.scene.strips.iter().filter(|s| wanted.contains(&s.id)) {
+        let signature = serde_json::to_string(&(
+            &strip.channels, &strip.input_key,
+            strip.inserts.iter().map(|i| (i.id, &i.uri, i.bypass)).collect::<Vec<_>>(),
+        ))?;
+        let rate = previews.get(&strip.id).map_or(48000, |p| p.render.rate());
+        let rebuild = previews.get(&strip.id).is_none_or(|p| p.signature != signature || p.rate != rate);
+        if rebuild {
+            if let Some(old) = previews.remove(&strip.id) {
+                disconnect_filter(graph, links, &old.render.name);
+            }
+            let mut scene = apply.scene.clone();
+            scene.strips = vec![strip.clone()];
+            scene.routes.clear();
+            let render = render::Render::new_preview(core, &scene, rate, metering.clone())?;
+            previews.insert(strip.id, Preview { render, signature, rate });
+        }
+        let preview = &previews[&strip.id];
+        preview.render.update_controls(&apply.scene);
+        let source = strip.input_key.as_ref().expect("preview input has a source");
+        let Some((&id, _)) = graph.objects.iter().find(|(_, node)|
+            node.kind == "Node" && node.props.get("node.name") == Some(source)) else { continue };
+        let ports = graph.ports(id, true);
+        for (ch, expected) in strip.channels.iter().enumerate() {
+            let matches: Vec<_> = ports.iter().filter(|(_, _, channel)| channel == expected).collect();
+            let port = ports.get(ch).filter(|(_, _, channel)| channel == expected)
+                .or_else(|| if matches.len() == 1 { Some(matches[0]) } else { None });
+            if let (Some((_, port, _)), Some(input)) = (port, preview.render.input_name(strip.id, ch)) {
+                wire(core, graph, linked, links, source, port, &preview.render.name, &input);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn run(
     rx: Rc<mpsc::Receiver<Apply>>,
     tx: mpsc::Sender<Update>,
@@ -426,6 +592,10 @@ fn run(
             }
         })
         .register();
+    // Creation is asynchronous. Stop suppressing retries once the node appears;
+    // this also lets us recreate a sink removed externally while its app lives.
+    let pending_ingresses = Rc::new(RefCell::new(BTreeSet::<String>::new()));
+    let pending = pending_ingresses.clone();
     let reg = registry.clone();
     let g = graph.clone();
     let keep = proxies.clone();
@@ -450,6 +620,8 @@ fn run(
                 Raw {
                     kind: kind.into(),
                     props: props.clone(),
+                    running: false,
+                    idle_after: None,
                     volume: 1.0,
                     mute: false,
                     channel_volumes: vec![],
@@ -457,6 +629,9 @@ fn run(
                 },
             );
             if obj.type_ == ObjectType::Node {
+                if let Some(name) = props.get("node.name") {
+                    pending.borrow_mut().remove(name);
+                }
                 let Ok(node) = reg.bind::<pw::node::Node, _>(obj) else {
                     return;
                 };
@@ -466,9 +641,21 @@ fn run(
                 let listener = node
                     .add_listener_local()
                     .info(move |info| {
-                        ginfo.borrow_mut().dirty = true;
-                        if let Some(properties) = info.props() {
-                            if let Some(raw) = ginfo.borrow_mut().objects.get_mut(&id) {
+                        let mut graph = ginfo.borrow_mut();
+                        graph.dirty = true;
+                        if let Some(raw) = graph.objects.get_mut(&id) {
+                            if info.change_mask().contains(pw::node::NodeChangeMask::STATE) {
+                                let running = matches!(info.state(), pw::node::NodeState::Running);
+                                if raw.running && !running {
+                                    // Graph edits can briefly idle a live stream. Keep
+                                    // its path intact while PipeWire settles.
+                                    raw.idle_after = Some(Instant::now() + Duration::from_millis(500));
+                                } else if running {
+                                    raw.idle_after = None;
+                                }
+                                raw.running = running;
+                            }
+                            if let Some(properties) = info.props() {
                                 for (k, v) in properties.iter() {
                                     raw.props.insert(k.into(), v.into());
                                 }
@@ -548,10 +735,10 @@ fn run(
     struct Controller {
         desired: Option<Apply>,
         render: Option<render::Render>,
+        previews: BTreeMap<Id, Preview>,
         signature: String,
         links: BTreeMap<(u32, u32), pw::link::Link>,
-        ingresses: Vec<pw::node::Node>,
-        requested: BTreeSet<Id>,
+        ingresses: BTreeMap<String, pw::node::Node>,
         render_error: String,
         states: Vec<PluginState>,
         rate: u32,
@@ -559,10 +746,10 @@ fn run(
     let controller = Rc::new(RefCell::new(Controller {
         desired: None,
         render: None,
+        previews: BTreeMap::new(),
         signature: String::new(),
         links: BTreeMap::new(),
-        ingresses: vec![],
-        requested: BTreeSet::new(),
+        ingresses: BTreeMap::new(),
         render_error: String::new(),
         states: vec![],
         rate: 48000,
@@ -576,22 +763,28 @@ fn run(
         topology_pending: bool,
         had_consumers: bool,
         latency_overflow: bool,
+        last_meter_request: Option<Instant>,
     }
     let activity = RefCell::new(Activity {
         observation: Observation::default(),
         topology_pending: true,
         had_consumers: false,
         latency_overflow: false,
+        last_meter_request: None,
     });
     let timer=mainloop.loop_().add_timer(move|_|{
         if stop.load(Ordering::Acquire){loop_quit.quit();return;}
         if !ready.get(){return;}
         let mut activity = activity.borrow_mut();
-        let Activity { observation: previous_observation, topology_pending, had_consumers, latency_overflow: previous_overflow } = &mut *activity;
-        let graph_changed = std::mem::take(&mut graph.borrow_mut().dirty);
+        let Activity { observation: previous_observation, topology_pending, had_consumers, latency_overflow: previous_overflow, last_meter_request } = &mut *activity;
+        let graph_changed = {
+            let mut graph = graph.borrow_mut();
+            graph.expire_activity(Instant::now());
+            std::mem::take(&mut graph.dirty)
+        };
         let mut command_changed = false;
         let mut state=controller.borrow_mut();
-        let Controller{desired,render,signature,links,ingresses,requested,render_error,states,rate}=&mut *state;
+        let Controller{desired,render,previews,signature,links,ingresses,render_error,states,rate}=&mut *state;
         if let Some(current)=render.as_mut(){current.reclaim();let observed=current.rate();if observed>0&&observed!=*rate{*rate=observed;signature.clear();*topology_pending=true;}}
         while let Ok(mut command)=rx.try_recv(){
             command_changed = true;
@@ -603,14 +796,39 @@ fn run(
             }
             *desired=Some(command);
         }
+        metering.refresh_polling(last_meter_request, Instant::now());
         let metering_enabled = metering.enabled();
         let has_consumers = metering_enabled;
+        let preview_rate_changed = previews.values().any(|p| p.render.rate() != p.rate);
         let latency_overflow = render.as_ref().is_some_and(|r| r.latency_overflow());
-        let needs_work = latency_overflow != *previous_overflow || has_consumers != *had_consumers || graph_changed || command_changed || *topology_pending || !render_error.is_empty();
+        let needs_work = preview_rate_changed || latency_overflow != *previous_overflow || has_consumers != *had_consumers || graph_changed || command_changed || *topology_pending || !render_error.is_empty();
         if !needs_work && !metering_enabled { return; }
         *had_consumers = has_consumers;
         *previous_overflow = latency_overflow;
         if needs_work { if let Some(apply)=desired.as_ref() {
+            let live_strips: BTreeSet<_> = graph.borrow().observation().streams.iter()
+                .filter_map(|stream| apply.bindings.get(&runtime_key(&stream.runtime)).copied())
+                .collect();
+            let needed_ingresses: BTreeSet<_> = apply.scene.strips.iter()
+                .filter(|s| s.kind == StripKind::Stream && live_strips.contains(&s.id) && !apply.suspended.contains(&s.id))
+                .map(|s| format!("alixer.input.{}", s.id)).collect();
+            // Saved strips are durable intent, not permanent system devices.
+            // Collect legacy endpoints too, but never evict an attached stream.
+            for (id, name) in graph.borrow().unused_playback_ingresses(&needed_ingresses) {
+                // Tear down owned monitor links before deleting their ports.
+                // Otherwise deleting the sink invalidates those server resources
+                // while their client proxies still await destruction.
+                let ports: BTreeSet<_> = graph.borrow().ports(id, true).into_iter()
+                    .chain(graph.borrow().ports(id, false)).map(|p| p.0).collect();
+                links.retain(|(source, target), _| !ports.contains(source) && !ports.contains(target));
+                ingresses.remove(&name);
+                if let Err(e) = registry.destroy_global(id).into_result() {
+                    *render_error = format!("Removing unused playback sink: {e}");
+                }
+            }
+            ingresses.retain(|name, _| pending_ingresses.borrow().contains(name)
+                || graph.borrow().objects.values().any(|node| node.kind == "Node"
+                    && node.props.get("node.name") == Some(name)));
             let key=topology_signature(apply);
             if *signature!=key {
                 let rebuild=if let Some(current)=render.as_mut(){
@@ -641,18 +859,19 @@ fn run(
                 let g=graph.borrow();
                 links.retain(|(source,target),_|g.objects.values().any(|o|o.kind=="Link"&&o.props.get("link.output.port").and_then(|v|v.parse::<u32>().ok())==Some(*source)&&o.props.get("link.input.port").and_then(|v|v.parse::<u32>().ok())==Some(*target)));
                 let mut linked = BTreeSet::new();
-                for strip in apply.scene.strips.iter().filter(|s|s.kind==StripKind::VirtualMic) {
+                if apply.scene.strips.iter().any(|s|s.kind==StripKind::VirtualMic) {
                     let exists=g.objects.values().any(|o|o.kind=="Node"&&o.props.get("node.name").map(String::as_str)==Some(MICROPHONE_KEY));
-                    if !exists&&requested.insert(strip.id) {
+                    if !exists&&pending_ingresses.borrow_mut().insert(MICROPHONE_KEY.into()) {
                         let props=properties!{"factory.name"=>"support.null-audio-sink","node.name"=>MICROPHONE_KEY,"node.description"=>"Alixer Microphone","media.class"=>"Audio/Source/Virtual","audio.channels"=>"2","audio.position"=>"[ FL FR ]","monitor.passthrough"=>"true","node.virtual"=>"true","object.linger"=>"true","priority.session"=>"-1000","monitor.channel-volumes"=>"false"};
                         // Retain a silent endpoint on shutdown, just like playback
                         // ingresses. Recorders must not fall back to the raw mic.
-                        match core.create_object::<pw::node::Node>("adapter",&props){Ok(node)=>ingresses.push(node),Err(e)=>{*render_error=e.to_string();requested.remove(&strip.id);}}
+                        match core.create_object::<pw::node::Node>("adapter",&props){Ok(node)=>{ingresses.insert(MICROPHONE_KEY.into(),node);},Err(e)=>{*render_error=e.to_string();pending_ingresses.borrow_mut().remove(MICROPHONE_KEY);}}
                     }
                 }
                 for strip in apply.scene.strips.iter().filter(|s|s.kind==StripKind::Input) {
-                    // Unrouted hardware inputs must not keep the whole graph awake.
-                    if !has_consumers && !apply.scene.routes.iter().any(|r| r.source == strip.id) { continue; }
+                    // UI-only previews have separate filters; only an explicit
+                    // audio route may attach a capture clock to playback.
+                    if !apply.scene.routes.iter().any(|r| r.source == strip.id) { continue; }
                     let Some(source)=strip.input_key.as_ref() else{continue};
                     if let Some((&id,_))=g.objects.iter().find(|(_,o)|o.kind=="Node"&&o.props.get("node.name")==Some(source)) {
                         let ports=g.ports(id,true);
@@ -665,12 +884,12 @@ fn run(
                         }
                     }
                 }
-                for strip in apply.scene.strips.iter().filter(|s|s.kind==StripKind::Stream&&!apply.suspended.contains(&s.id)) {
+                for strip in apply.scene.strips.iter().filter(|s|s.kind==StripKind::Stream&&live_strips.contains(&s.id)&&!apply.suspended.contains(&s.id)) {
                     let name=format!("alixer.input.{}",strip.id);
                     let ingress=g.objects.iter().find(|(_,o)|o.kind=="Node"&&o.props.get("node.name")==Some(&name)).map(|(id,_)|*id);
-                    if ingress.is_none()&&requested.insert(strip.id) {
+                    if ingress.is_none()&&pending_ingresses.borrow_mut().insert(name.clone()) {
                         let props=properties!{"factory.name"=>"support.null-audio-sink","node.name"=>name.clone(),"node.description"=>format!("Alixer · {}",strip.name),"media.class"=>"Audio/Sink","audio.channels"=>strip.channels.len().to_string(),"audio.position"=>format!("[ {} ]",strip.channels.join(" ")),"object.linger"=>"true","node.virtual"=>"true","priority.session"=>"-1000","alixer.strip"=>strip.id.to_string(),"monitor.channel-volumes"=>"false"};
-                        match core.create_object::<pw::node::Node>("adapter",&props){Ok(node)=>ingresses.push(node),Err(e)=>{*render_error=e.to_string();requested.remove(&strip.id);}}
+                        match core.create_object::<pw::node::Node>("adapter",&props){Ok(node)=>{ingresses.insert(name.clone(),node);},Err(e)=>{*render_error=e.to_string();pending_ingresses.borrow_mut().remove(&name);}}
                     }
                     let Some(ingress)=ingress else{continue};
                     if let Some(m)=metadata.borrow().as_ref() {
@@ -685,6 +904,9 @@ fn run(
                             }
                         }
                     }
+                    // Keep paused applications attached, but only connect the
+                    // monitor while an application is actually producing audio.
+                    if !g.has_running_source(ingress) { continue; }
                     let monitors=g.ports(ingress,true);
                     for (ch,(_,port,_)) in monitors.iter().enumerate() {
                         if let Some(input)=render.input_name(strip.id,ch){
@@ -705,6 +927,9 @@ fn run(
                         if let Some((_,target,_))=target{wire(&core,&g,&mut linked,links,&render.name,port,output,target);}
                     }
                 }
+                if let Err(e) = sync_previews(&core, &g, apply, &metering, previews, links, &mut linked) {
+                    *render_error = format!("Input preview: {e:#}");
+                }
                 links.retain(|ports, _| linked.contains(ports));
             }
         }
@@ -712,10 +937,18 @@ fn run(
         if needs_work { *previous_observation = graph.borrow().observation(); }
         let observation=previous_observation.clone();
         let status=if !render_error.is_empty(){format!("Audio error: {render_error}")}else if let Some(render)=render.as_ref(){if render.latency_overflow(){"Audio error: plugin compensation exceeds 16384 frames; outputs silenced".into()}else if !render.warnings.is_empty(){format!("Connected · unavailable inserts bypassed: {}",render.warnings.join("; "))}else{format!("Connected to PipeWire · {rate} Hz")}}else{"Connected to PipeWire".into()};
-        metering.clear_request();
-        let peaks=render.as_ref().map(|r|r.peaks()).unwrap_or_default();
-        let channel_peaks=render.as_ref().map(|r|r.channel_peaks()).unwrap_or_default();
-        let plugin_meters=render.as_ref().map(|r|r.plugin_meters()).unwrap_or_default();
+        let mut peaks=render.as_ref().map(|r|r.peaks()).unwrap_or_default();
+        let mut channel_peaks=render.as_ref().map(|r|r.channel_peaks()).unwrap_or_default();
+        let mut plugin_meters=render.as_ref().map(|r|r.plugin_meters()).unwrap_or_default();
+        peaks.retain(|(id, _)| !previews.contains_key(id));
+        channel_peaks.retain(|(id, _)| !previews.contains_key(id));
+        for preview in previews.values() {
+            peaks.extend(preview.render.peaks());
+            channel_peaks.extend(preview.render.channel_peaks());
+            let meters = preview.render.plugin_meters();
+            plugin_meters.retain(|(id, _, _)| !meters.iter().any(|(insert, _, _)| insert == id));
+            plugin_meters.extend(meters);
+        }
         if updates.send(Update{observation,status,peaks,channel_peaks,plugin_meters,states:std::mem::take(states)}).is_err(){loop_quit.quit();}
     });
     timer
@@ -806,6 +1039,68 @@ fn balanced_volumes(values: &[f32], fallback: &[f32], channels: usize, gain: f32
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ingress_activity_expires_after_pausing_and_disappears_with_source() {
+        let mut graph = Graph::default();
+        graph.objects.insert(2, Raw { running: true, ..Default::default() });
+        graph.objects.insert(3, Raw {
+            kind: "Link".into(),
+            props: BTreeMap::from([
+                ("link.input.node".into(), "1".into()),
+                ("link.output.node".into(), "2".into()),
+            ]),
+            ..Default::default()
+        });
+        assert!(graph.has_running_source(1));
+        assert!(!graph.has_running_source(4));
+        let deadline = Instant::now() + Duration::from_millis(500);
+        let source = graph.objects.get_mut(&2).unwrap();
+        source.running = false;
+        source.idle_after = Some(deadline);
+        graph.expire_activity(deadline - Duration::from_millis(1));
+        assert!(graph.has_running_source(1), "brief state transitions keep audio connected");
+        assert!(!graph.dirty);
+        graph.expire_activity(deadline);
+        assert!(!graph.has_running_source(1), "paused streams no longer drive the mixer");
+        assert!(graph.dirty);
+        graph.objects.get_mut(&2).unwrap().running = true;
+        assert!(graph.has_running_source(1));
+        graph.objects.remove(&2);
+        assert!(!graph.has_running_source(1));
+    }
+    #[test]
+    fn collects_only_unneeded_unconnected_playback_sinks() {
+        let mut graph = Graph::default();
+        for (id, name, class) in [
+            (1, "alixer.input.saved", "Audio/Sink"),
+            (2, "lixer.input.orphan", "Audio/Sink"),
+            (3, "alixer.input.paused", "Audio/Sink"),
+            (4, "alixer.input.pending-route", "Audio/Sink"),
+            (5, "alixer.microphone", "Audio/Source/Virtual"),
+            (6, "speakers", "Audio/Sink"),
+        ] {
+            graph.objects.insert(id, Raw {
+                kind: "Node".into(),
+                props: BTreeMap::from([
+                    ("node.name".into(), name.into()),
+                    ("media.class".into(), class.into()),
+                ]),
+                ..Default::default()
+            });
+        }
+        graph.objects.insert(10, Raw {
+            kind: "Link".into(),
+            props: BTreeMap::from([("link.input.node".into(), "3".into())]),
+            ..Default::default()
+        });
+        let needed = BTreeSet::from(["alixer.input.pending-route".into()]);
+        assert_eq!(graph.unused_playback_ingresses(&needed), vec![
+            (1, "alixer.input.saved".into()), (2, "lixer.input.orphan".into()),
+        ]);
+        graph.objects.remove(&10);
+        assert!(graph.unused_playback_ingresses(&needed).iter().any(|(id, _)| *id == 3),
+            "a paused sink becomes collectible only after its incoming link disappears");
+    }
     #[test]
     fn old_and_new_internal_nodes_are_excluded_from_physical_outputs() {
         let mut graph = Graph::default();

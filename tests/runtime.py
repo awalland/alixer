@@ -111,8 +111,15 @@ with tempfile.TemporaryDirectory(prefix="alixer-test-") as tmp:
             for name in ("test.speakers","test.headphones"):
                 layout="FL FR" if name=="test.speakers" else "FL FR FC LFE RL RR SL SR"
                 command(["pw-cli","create-node","adapter",'{ factory.name = support.null-audio-sink node.name = "'+name+'" node.description = "'+name+'" media.class = Audio/Sink audio.position = [ '+layout+' ] object.linger = true }'])
+            # Simulate unused lingering endpoints from both current and old builds.
+            for name in ("alixer.input.orphan", "lixer.input.orphan"):
+                command(["pw-cli","create-node","adapter",'{ factory.name = support.null-audio-sink node.name = "'+name+'" media.class = Audio/Sink audio.position = [ FL FR ] object.linger = true }'])
+            def playback_sinks():
+                return [o for o in json.loads(command(["pw-dump"]))
+                        if o.get("info",{}).get("props",{}).get("node.name", "").startswith(("alixer.input.", "lixer.input."))]
             daemon=spawn([str(BIN/"alixerd")])
             wait(snapshot,"audio service")
+            wait(lambda:not playback_sinks(),"startup collects orphaned current and legacy sinks")
             wait(lambda:len(snapshot()["observation"]["outputs"])>=2,"virtual outputs")
             def masters():return [s for s in snapshot()["scene"]["strips"] if s["kind"]=="Output"]
             wait(lambda:len(masters())==2,"one master per endpoint")
@@ -201,6 +208,7 @@ with tempfile.TemporaryDirectory(prefix="alixer-test-") as tmp:
             assert events.read_text()=="I","unrelated streams must not recreate or destroy a running LV2 instance"
             wait(lambda:len(snapshot()["observation"]["streams"])==1,"temporary browser streams closed")
             assert snapshot()["active_streams"]==[strip],"saved offline browser strips must not be marked active"
+            wait(lambda:len(playback_sinks())==1,"closed browser sinks collected without interrupting music")
             # Reproduce an upgrade with a surviving stream on its old Lixer
             # ingress. The logical strip ID stays the same across the rename.
             daemon.terminate();assert daemon.wait(timeout=5)==0
@@ -217,6 +225,7 @@ with tempfile.TemporaryDirectory(prefix="alixer-test-") as tmp:
             daemon=spawn([str(BIN/"alixerd")])
             wait(snapshot,"Alixer service after legacy ingress parking")
             wait(lambda:stream_at("alixer.input."+strip),"surviving stream handed over to Alixer ingress")
+            wait(lambda:len(playback_sinks())==1,"legacy sink collected after handover")
             wait(lambda:any(p[1]>.1 for p in snapshot()["peaks"]),"audio restored after Lixer-to-Alixer handover")
             edit(dict(type="Mute",strip=strip,value=True))
             wait(lambda:all(p[1]<.0001 for p in snapshot()["peaks"]),"muted meter")
@@ -331,6 +340,23 @@ wireplumber.profiles = { main = { custom.alixer-output-name-test = required } }
                 command(["wpctl","status"])
             player.terminate(); player.wait(timeout=5)
             wait(engine_idle, "mixer suspends after playback ends, including saved LV2 strips")
+            wait(lambda:not playback_sinks(),"last playback sink collected")
+            edit(dict(type="Gain",strip=strip,value=.6))
+            daemon.terminate();assert daemon.wait(timeout=5)==0
+            daemon=spawn([str(BIN/"alixerd")])
+            wait(snapshot,"service restarted with saved offline strips")
+            time.sleep(.5)
+            assert not playback_sinks(),"saved settings must not recreate offline playback sinks"
+            assert next(s for s in snapshot()["scene"]["strips"] if s["id"]==strip)["gain"]==.6
+            player=spawn(["pw-play","--target","test.speakers",str(path)])
+            wait(lambda:strip in snapshot()["active_streams"],"returning app reuses saved strip")
+            wait(lambda:len(playback_sinks())==1 and any(p[1]>.01 for p in snapshot()["peaks"]),"returning app gets a working sink")
+            sink=playback_sinks()[0]
+            command(["pw-cli","destroy",str(sink["id"])])
+            wait(lambda:len(playback_sinks())==1 and playback_sinks()[0]["info"]["props"]["object.serial"]!=sink["info"]["props"]["object.serial"],"externally removed live sink recreated")
+            wait(lambda:any(p[1]>.01 for p in snapshot()["peaks"]),"audio restored after external sink removal")
+            player.terminate();player.wait(timeout=5)
+            wait(lambda:not playback_sinks(),"recreated sink collected after app exits")
             print("PASS: native discovery/DSP, uninterrupted stream changes/LV2 reuse, exact active strips, legacy Lixer ingress handover, live aux controls, retained/deleted masters, device controls, downtime/hotplug reconciliation, and global output names/reset through WirePlumber and PulseAudio")
     except Exception:
         for i,log in enumerate(logs):
