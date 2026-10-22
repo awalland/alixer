@@ -82,6 +82,7 @@ fn main() -> Result<()> {
         },
         peaks: vec![],
         channel_peaks: vec![],
+        plugin_meters: vec![],
     };
     let public = Arc::new(Mutex::new(initial));
     let published = public.clone();
@@ -124,7 +125,10 @@ fn main() -> Result<()> {
     let mut last_apply = String::new();
     let mut last_publish = Instant::now();
     let mut channel_peaks = vec![];
+    let mut plugin_meters = vec![];
     let mut output_controls = vec![];
+    // Metadata is immutable for a running service; knob drags must not rescan LV2 bundles.
+    let mut plugin_metadata = std::collections::BTreeMap::new();
     if let Err(e) = output_names::write(&saved.scene, &output_names::config_path()) {
         eprintln!("Output names: {e:#}");
     }
@@ -152,6 +156,7 @@ fn main() -> Result<()> {
                 status = update.status;
                 peaks = update.peaks;
                 channel_peaks = update.channel_peaks;
+                plugin_meters = update.plugin_meters;
                 if status.starts_with("Disconnected") {
                     last_apply.clear();
                 }
@@ -194,6 +199,7 @@ fn main() -> Result<()> {
                         status: status.clone(),
                         peaks: peaks.clone(),
                         channel_peaks: channel_peaks.clone(),
+                        plugin_meters: plugin_meters.clone(),
                     })),
                     Command::Plugins => {
                         unreachable!("Catalog discovery is handled by the IPC worker")
@@ -229,7 +235,7 @@ fn main() -> Result<()> {
                         match edit {
                             Edit::AddInsert { strip, uri } => {
                                 let s = next.scene.strip(*strip).context("Unknown strip")?;
-                                alixer_lv2::validate(
+                                let plugin = alixer_lv2::validate(
                                     &Insert {
                                         id: Id::new_v4(),
                                         uri: uri.clone(),
@@ -239,6 +245,7 @@ fn main() -> Result<()> {
                                     },
                                     s.channels.len(),
                                 )?;
+                                plugin_metadata.insert((uri.clone(), s.channels.len()), plugin);
                             }
                             Edit::SetControl {
                                 strip,
@@ -252,7 +259,14 @@ fn main() -> Result<()> {
                                     .iter()
                                     .find(|i| i.id == *insert)
                                     .context("Unknown insert")?;
-                                let plugin = alixer_lv2::validate(slot, s.channels.len())?;
+                                let key = (slot.uri.clone(), s.channels.len());
+                                if !plugin_metadata.contains_key(&key) {
+                                    plugin_metadata.insert(
+                                        key.clone(),
+                                        alixer_lv2::validate(slot, s.channels.len())?,
+                                    );
+                                }
+                                let plugin = &plugin_metadata[&key];
                                 let port = plugin
                                     .ports
                                     .iter()
@@ -360,6 +374,7 @@ fn main() -> Result<()> {
                 status: status.clone(),
                 peaks: peaks.clone(),
                 channel_peaks: channel_peaks.clone(),
+                plugin_meters: plugin_meters.clone(),
             };
             last_publish = Instant::now();
         }

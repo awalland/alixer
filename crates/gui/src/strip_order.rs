@@ -108,6 +108,7 @@ mod tests {
                     status: String::new(),
                     peaks: vec![],
                     channel_peaks: vec![],
+                    plugin_meters: vec![],
                 },
                 panels: vec![],
                 labels: BTreeMap::new(),

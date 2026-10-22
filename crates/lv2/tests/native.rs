@@ -79,6 +79,10 @@ lv2:port [ a lv2:InputPort, lv2:AudioPort ; lv2:index 0 ; lv2:symbol "input" ; l
     audio[0].fill(1.0);
     plugin.run(&mut audio, 512);
     assert_eq!(audio[0][0], 0.75);
+    assert_eq!(
+        f32::from_bits(plugin.meters["worker"].load(std::sync::atomic::Ordering::Relaxed)),
+        2.0
+    );
     slot.state = Some(plugin.save_state(&root.join("state")).unwrap());
     drop(plugin);
     let mut restored = alixer_lv2::Instance::new(&slot, 1, 48000.0, 512).unwrap();

@@ -27,6 +27,9 @@ not recognize it. After verifying all required tools/libraries are installed,
 use `bash packaging/rpm/build.sh --skip-build-deps`. This does not make the
 runtime dependencies optional. `--prepare-only` generates inputs without building.
 
+The RPM requires the LSP LV2 effects package (`lv2-lsp-plugins` on openSUSE,
+`lsp-plugins-lv2` on Fedora) for the dedicated EQ, compressor and limiter editors.
+
 Install the matching binary RPM with zypper (replace the filename as needed):
 
 ```sh

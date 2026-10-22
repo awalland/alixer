@@ -85,6 +85,7 @@ pub struct Update {
     pub status: String,
     pub peaks: Vec<(Id, f32)>,
     pub channel_peaks: Vec<(Id, Vec<f32>)>,
+    pub plugin_meters: Vec<(Id, String, f32)>,
     pub states: Vec<PluginState>,
 }
 pub struct Backend {
@@ -113,6 +114,7 @@ impl Backend {
                             status: format!("Disconnected: {e:#}"),
                             peaks: vec![],
                             channel_peaks: vec![],
+                            plugin_meters: vec![],
                             states: vec![],
                         });
                     }
@@ -652,7 +654,8 @@ fn run(
         let status=if !render_error.is_empty(){format!("Audio error: {render_error}")}else if let Some(render)=render.as_ref(){if render.latency_overflow(){"Audio error: plugin compensation exceeds 16384 frames; outputs silenced".into()}else if !render.warnings.is_empty(){format!("Connected · unavailable inserts bypassed: {}",render.warnings.join("; "))}else{format!("Connected to PipeWire · {rate} Hz")}}else{"Connected to PipeWire".into()};
         let peaks=render.as_ref().map(|r|r.peaks()).unwrap_or_default();
         let channel_peaks=render.as_ref().map(|r|r.channel_peaks()).unwrap_or_default();
-        if updates.send(Update{observation,status,peaks,channel_peaks,states:std::mem::take(states)}).is_err(){loop_quit.quit();}
+        let plugin_meters=render.as_ref().map(|r|r.plugin_meters()).unwrap_or_default();
+        if updates.send(Update{observation,status,peaks,channel_peaks,plugin_meters,states:std::mem::take(states)}).is_err(){loop_quit.quit();}
     });
     timer
         .update_timer(
@@ -675,6 +678,7 @@ fn run(
             status: "Disconnected: audio server restarted".into(),
             peaks: vec![],
             channel_peaks: vec![],
+            plugin_meters: vec![],
             states,
         });
         anyhow::bail!("audio server disconnected");

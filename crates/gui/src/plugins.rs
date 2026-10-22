@@ -1,4 +1,5 @@
 use super::*;
+use alixer_core::effects::Effect;
 
 impl App {
     pub(super) fn ensure_catalog(&mut self) {
@@ -15,6 +16,9 @@ impl App {
     }
 
     pub(super) fn plugin_name(&self, uri: &str) -> String {
+        if let Some(effect) = Effect::from_uri(uri) {
+            return effect.name().into();
+        }
         self.catalog
             .as_array()
             .and_then(|plugins| plugins.iter().find(|p| p["uri"].as_str() == Some(uri)))
@@ -29,14 +33,14 @@ impl App {
     }
 
     fn insert_menu(&mut self, ui: &mut egui::Ui, strip: &Strip, index: Option<usize>) {
-        if ui.button("Add plugin…").clicked() {
+        if ui.button("Add effect…").clicked() {
             self.open_plugin_picker(strip.id);
             ui.close();
         }
         if let Some(index) = index {
             let insert = &strip.inserts[index];
             ui.separator();
-            if ui.button("Edit controls").clicked() {
+            if ui.button("Open editor…").clicked() {
                 self.selected = Some(strip.id);
                 self.selected_insert = Some((strip.id, insert.id));
                 self.ensure_catalog();
@@ -69,7 +73,7 @@ impl App {
             }
             ui.separator();
             if ui
-                .button(RichText::new("Remove plugin").color(RED))
+                .button(RichText::new("Remove effect").color(RED))
                 .clicked()
             {
                 self.edit(Edit::RemoveInsert {
@@ -107,7 +111,7 @@ impl App {
                     ui.painter().text(
                         ui.max_rect().center(),
                         egui::Align2::CENTER_CENTER,
-                        "Right-click to add\nLV2 plugins",
+                        "Right-click to add\neffects",
                         egui::FontId::proportional(11.0),
                         DIM,
                     );
@@ -166,7 +170,7 @@ impl App {
             return;
         };
         let mut open = true;
-        egui::Window::new("Add LV2 plugin")
+        egui::Window::new("Add effect")
             .id(egui::Id::new("plugin-picker"))
             .open(&mut open)
             .default_size(Vec2::new(680.0, 480.0))
@@ -184,7 +188,7 @@ impl App {
                 .on_hover_text(&strip.name);
                 ui.add(
                     egui::TextEdit::singleline(&mut self.filter)
-                        .hint_text("Search plugins…")
+                        .hint_text("Search effects…")
                         .desired_width(f32::INFINITY),
                 );
                 if ui
@@ -215,37 +219,34 @@ impl App {
                     .cloned()
                     .collect();
                 if candidates.is_empty() && self.catalog.is_array() {
-                    ui.label("No supported plugins match this search and channel layout.");
+                    ui.label(if strip.channels.len() > 2 {
+                        "These effects support mono and stereo strips."
+                    } else if !self.filter.trim().is_empty() {
+                        "No supported effects match this search."
+                    } else {
+                        "Install the LSP LV2 package to use EQ, compressor and limiter, then refresh."
+                    });
                 }
                 egui::ScrollArea::vertical()
                     .id_salt("plugin-picker-list")
                     .max_height(ui.available_height().max(1.0))
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        let column_width =
-                            ((ui.available_width() - ui.spacing().item_spacing.x) / 2.0).max(1.0);
-                        for row in candidates.chunks(2) {
-                            ui.horizontal(|ui| {
-                                for plugin in row {
-                                    let Some(uri) = plugin["uri"].as_str() else {
-                                        continue;
-                                    };
-                                    let name = self.plugin_name(uri);
-                                    if ui
-                                        .add_sized(
-                                            [column_width, 26.0],
-                                            egui::Button::new(&name).truncate(),
-                                        )
-                                        .on_hover_text(format!("{name}\n{uri}"))
-                                        .clicked()
-                                    {
-                                        self.edit(Edit::AddInsert {
-                                            strip: id,
-                                            uri: uri.to_owned(),
-                                        });
+                        for plugin in &candidates {
+                            let Some(uri) = plugin["uri"].as_str() else { continue; };
+                            let Some(effect) = Effect::from_uri(uri) else { continue; };
+                            ui.group(|ui| {
+                                ui.horizontal(|ui| {
+                                    ui.vertical(|ui| {
+                                        ui.label(RichText::new(effect.name()).size(20.0).color(MINT));
+                                        ui.label(effect.description());
+                                        ui.label(RichText::new("LSP · LV2").small().color(DIM));
+                                    });
+                                    if ui.button(format!("Add {}", effect.name())).clicked() {
+                                        self.edit(Edit::AddInsert { strip: id, uri: uri.to_owned() });
                                         self.plugin_picker = None;
                                     }
-                                }
+                                });
                             });
                         }
                     });
@@ -263,7 +264,10 @@ fn matches_plugin(plugin: &serde_json::Value, channels: usize, query: &str) -> b
     let Some(ports) = plugin["ports"].as_array() else {
         return false;
     };
-    (name.to_lowercase().contains(&query) || uri.to_lowercase().contains(&query))
+    (name.to_lowercase().contains(&query)
+        || uri.to_lowercase().contains(&query)
+        || Effect::from_uri(uri).is_some_and(|e| e.name().to_lowercase().contains(&query)))
+        && Effect::from_uri(uri).is_some()
         && plugin["unsupported"]
             .as_array()
             .is_some_and(|requirements| requirements.is_empty())
@@ -283,7 +287,7 @@ fn matches_plugin(plugin: &serde_json::Value, channels: usize, query: &str) -> b
 mod tests {
     use super::*;
     fn plugin() -> serde_json::Value {
-        serde_json::json!({"name":"Studio EQ","uri":"urn:test:studio-eq","unsupported":[],"ports":[
+        serde_json::json!({"name":"Parametric EQ","uri":"http://lsp-plug.in/plugins/lv2/para_equalizer_x8_stereo","unsupported":[],"ports":[
             {"audio":true,"input":true},{"audio":true,"input":true},
             {"audio":true,"input":false},{"audio":true,"input":false}
         ]})
@@ -307,7 +311,7 @@ mod tests {
             if populated {
                 strip.inserts.push(Insert {
                     id: Id::new_v4(),
-                    uri: "urn:test:studio-eq".into(),
+                    uri: "http://lsp-plug.in/plugins/lv2/para_equalizer_x8_stereo".into(),
                     bypass: false,
                     controls: BTreeMap::new(),
                     state: None,
@@ -324,6 +328,7 @@ mod tests {
                 status: String::new(),
                 peaks: vec![],
                 channel_peaks: vec![],
+                plugin_meters: vec![],
             };
             let mut this = Self {
                 app,
@@ -398,11 +403,11 @@ mod tests {
     fn empty_rack_context_menu_can_add_a_plugin() {
         let mut h = Harness::new(false);
         h.click(h.rack.center(), egui::PointerButton::Secondary);
-        h.click_label("Add plugin…");
+        h.click_label("Add effect…");
         assert_eq!(h.app.plugin_picker, Some(h.strip.id));
-        h.click_label("Studio EQ");
+        h.click_label("Add Parametric EQ");
         assert!(
-            matches!(h.commands.try_recv().unwrap(),Command::Edit(Edit::AddInsert{strip,uri}) if strip==h.strip.id&&uri=="urn:test:studio-eq")
+            matches!(h.commands.try_recv().unwrap(),Command::Edit(Edit::AddInsert{strip,uri}) if strip==h.strip.id&&uri=="http://lsp-plug.in/plugins/lv2/para_equalizer_x8_stereo")
         );
         assert_eq!(h.app.plugin_picker, None);
     }
@@ -410,12 +415,12 @@ mod tests {
     fn insert_rows_select_controls_and_offer_bypass() {
         let mut h = Harness::new(true);
         let insert = h.strip.inserts[0].id;
-        h.click_label("● Studio EQ");
+        h.click_label("● Parametric EQ");
         assert_eq!(h.app.selected_insert, Some((h.strip.id, insert)));
         let pos = h
             .labels
             .iter()
-            .find(|(text, _)| text == "● Studio EQ")
+            .find(|(text, _)| text == "● Parametric EQ")
             .unwrap()
             .1
             .center();
@@ -429,9 +434,12 @@ mod tests {
     fn picker_filters_search_and_channel_layout() {
         let p = plugin();
         assert!(matches_plugin(&p, 2, " eq "));
-        assert!(matches_plugin(&p, 2, "STUDIO-EQ"));
+        assert!(matches_plugin(&p, 2, "PARA_EQUALIZER"));
         assert!(!matches_plugin(&p, 1, ""));
         assert!(!matches_plugin(&p, 2, "compressor"));
+        let mut unrelated = p.clone();
+        unrelated["uri"] = serde_json::json!("urn:another:equalizer");
+        assert!(!matches_plugin(&unrelated, 2, ""));
         let mut unsupported = p.clone();
         unsupported["unsupported"] = serde_json::json!(["Unsupported port type: events"]);
         assert!(!matches_plugin(&unsupported, 2, ""));

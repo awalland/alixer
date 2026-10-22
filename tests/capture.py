@@ -163,6 +163,22 @@ with tempfile.TemporaryDirectory(prefix="alixer-capture-") as tmp:
         wait(lambda: any(p[0] == master["id"] and p[1] > .09 for p in snapshot()["peaks"]), "saved capture routes restored")
         wait(lambda: meeting_sources() == {"alixer.microphone"}, "meeting reconnected after service restart")
         assert .09 < record_peak() < .15
+        if os.environ.get("ALIXER_TEST_LSP_EFFECTS"):
+            # Verify output-control telemetry through the whole audio/service/IPC path.
+            layout = "mono" if len(mic["channels"]) == 1 else "stereo"
+            for effect in ("para_equalizer_x8", "compressor", "limiter"):
+                edit(dict(type="AddInsert", strip=mic["id"], uri=f"http://lsp-plug.in/plugins/lv2/{effect}_{layout}"))
+                slot = next(s for s in snapshot()["scene"]["strips"] if s["id"] == mic["id"])["inserts"][-1]
+                wait(lambda: any(i == slot["id"] and v > .01 for i, symbol, v in snapshot()["plugin_meters"] if symbol in ("im", "iml", "ilm", "ilm_l")), "live LSP input meters")
+                edit(dict(type="SetControl", strip=mic["id"], insert=slot["id"], symbol="g_out", value=.5))
+                time.sleep(.3)
+                assert .04 < record_peak() < .09, "dedicated editor parameter must affect real audio"
+                edit(dict(type="BypassInsert", strip=mic["id"], insert=slot["id"], bypass=True))
+                wait(lambda: not any(i == slot["id"] for i, _, _ in snapshot()["plugin_meters"]), "bypassed meters removed")
+                time.sleep(.3)
+                assert .09 < record_peak() < .15, "bypass restores unprocessed audio"
+                edit(dict(type="RemoveInsert", strip=mic["id"], insert=slot["id"]))
+            print("PASS: curated LSP effects, live IPC meters, parameter edits and bypass on captured audio")
         print("PASS: input discovery, amber strips, silent defaults, PulseAudio source, captured samples, gain/mute, hotplug and persistence")
     except Exception:
         for index, log in enumerate(logs):

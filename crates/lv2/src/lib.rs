@@ -12,7 +12,7 @@ use std::{collections::BTreeMap, ffi::{c_char,c_void,CStr,CString}, ptr, sync::{
 type Ptr = *mut c_void;
 const LV2: &str = "http://lv2plug.in/ns/lv2core#";
 #[derive(Clone,Debug,Serialize,Deserialize)]
-pub struct Port { pub index:u32,pub symbol:String,pub name:String,pub input:bool,pub audio:bool,pub control:bool,pub optional:bool,pub default:f32,pub min:f32,pub max:f32,pub toggle:bool,pub integer:bool,pub latency:bool }
+pub struct Port { pub index:u32,pub symbol:String,pub name:String,pub input:bool,pub audio:bool,pub control:bool,pub optional:bool,pub default:f32,pub min:f32,pub max:f32,pub toggle:bool,pub integer:bool,pub latency:bool, #[serde(default)] pub logarithmic:bool, #[serde(default)] pub unit:String, #[serde(default)] pub choices:Vec<(f32,String)> }
 #[derive(Clone,Debug,Serialize,Deserialize)]
 pub struct Plugin { pub uri:String,pub name:String,pub ports:Vec<Port>,pub required:Vec<String>, pub unsupported:Vec<String> }
 impl Plugin {
@@ -49,6 +49,35 @@ impl World {
         let node=unsafe{self.node(class)?};
         let result=unsafe{(self.f::<unsafe extern "C" fn(Ptr,Ptr,Ptr)->bool>(b"lilv_port_has_property\0")?)(plugin,port,node)};
         unsafe{self.free_node(node)}; Ok(result)
+    }
+    unsafe fn control_metadata(&self, plugin:Ptr, port:Ptr)->Result<(String,Vec<(f32,String)>)> {
+        unsafe {
+            let predicate=self.node("http://lv2plug.in/ns/extensions/units#unit")?;
+            let unit=(self.f::<unsafe extern "C" fn(Ptr,Ptr,Ptr)->Ptr>(b"lilv_port_get\0")?)(plugin,port,predicate);
+            self.free_node(predicate);
+            let mut unit_name=String::new();
+            if !unit.is_null() {
+                let symbol=self.node("http://lv2plug.in/ns/extensions/units#symbol")?;
+                let value=(self.f::<unsafe extern "C" fn(Ptr,Ptr,Ptr,Ptr)->Ptr>(b"lilv_world_get\0")?)(self.world,unit,symbol,ptr::null_mut());
+                unit_name=self.text(value,false)?;
+                self.free_node(value);self.free_node(symbol);self.free_node(unit);
+            }
+            let points=(self.f::<unsafe extern "C" fn(Ptr,Ptr)->Ptr>(b"lilv_port_get_scale_points\0")?)(plugin,port);
+            let mut choices=vec![];
+            if !points.is_null() {
+                let mut it=(self.f::<unsafe extern "C" fn(Ptr)->Ptr>(b"lilv_scale_points_begin\0")?)(points);
+                while !(self.f::<unsafe extern "C" fn(Ptr,Ptr)->bool>(b"lilv_scale_points_is_end\0")?)(points,it) {
+                    let point=(self.f::<unsafe extern "C" fn(Ptr,Ptr)->Ptr>(b"lilv_scale_points_get\0")?)(points,it);
+                    let value=(self.f::<unsafe extern "C" fn(Ptr)->Ptr>(b"lilv_scale_point_get_value\0")?)(point);
+                    let label=(self.f::<unsafe extern "C" fn(Ptr)->Ptr>(b"lilv_scale_point_get_label\0")?)(point);
+                    choices.push(((self.f::<unsafe extern "C" fn(Ptr)->f32>(b"lilv_node_as_float\0")?)(value),self.text(label,false)?));
+                    it=(self.f::<unsafe extern "C" fn(Ptr,Ptr)->Ptr>(b"lilv_scale_points_next\0")?)(points,it);
+                }
+                (self.f::<unsafe extern "C" fn(Ptr)>(b"lilv_scale_points_free\0")?)(points);
+            }
+            choices.sort_by(|a,b|a.0.total_cmp(&b.0));
+            Ok((unit_name,choices))
+        }
     }
     pub fn plugins(&self)->Result<Vec<Plugin>> {
         unsafe {
@@ -96,7 +125,8 @@ impl World {
                 let designation=self.node(&format!("{LV2}designation"))?;
                 let value=(self.f::<unsafe extern "C" fn(Ptr,Ptr,Ptr)->Ptr>(b"lilv_port_get\0")?)(plugin,port,designation);
                 let latency=self.text(value,true)?==format!("{LV2}latency");self.free_node(value);self.free_node(designation);
-                ports.push(Port {index,symbol,name:port_name,input,audio,control,optional,default:d,min:lo,max:hi,toggle:self.property(plugin,port,&format!("{LV2}toggled"))?,integer:self.property(plugin,port,&format!("{LV2}integer"))?,latency:control&&latency});
+                let (unit,choices)=if control {self.control_metadata(plugin,port)?}else{Default::default()};
+                ports.push(Port {unit,choices,logarithmic:self.property(plugin,port,"http://lv2plug.in/ns/ext/port-props#logarithmic")?,index,symbol,name:port_name,input,audio,control,optional,default:d,min:lo,max:hi,toggle:self.property(plugin,port,&format!("{LV2}toggled"))?,integer:self.property(plugin,port,&format!("{LV2}integer"))?,latency:control&&latency});
             }
             let nodes=(self.f::<unsafe extern "C" fn(Ptr)->Ptr>(b"lilv_plugin_get_required_features\0")?)(plugin);
             let mut required=unsupported;
@@ -134,6 +164,7 @@ pub struct Instance {
     world:World, raw:*mut NativeInstance, pub plugin:Plugin,
     buffers:Vec<Vec<f32>>, controls:Vec<f32>,
     pub parameters:BTreeMap<String,Arc<AtomicU32>>,
+    pub meters:BTreeMap<String,Arc<AtomicU32>>,
 }
 impl Instance {
     pub fn new(insert:&Insert,channels:usize,rate:f64,max_frames:usize)->Result<Self>{
@@ -144,13 +175,14 @@ impl Instance {
             let host=host::Host::new(rate,max_frames);
             let raw=(world.f::<unsafe extern "C" fn(Ptr,f64,*const *const c_void)->*mut NativeInstance>(b"lilv_plugin_instantiate\0")?)(plugin,rate,host.pointers().cast());
             if raw.is_null(){bail!("Plugin instantiation failed");}
-            let mut this=Self{id:insert.id,host,plugin_ptr:plugin,world,raw,controls:vec![0.0;info.ports.len()],buffers:info.ports.iter().map(|_|vec![0.0;max_frames]).collect(),parameters:BTreeMap::new(),plugin:info};
+            let mut this=Self{id:insert.id,host,plugin_ptr:plugin,world,raw,controls:vec![0.0;info.ports.len()],buffers:info.ports.iter().map(|_|vec![0.0;max_frames]).collect(),parameters:BTreeMap::new(),meters:BTreeMap::new(),plugin:info};
             for port in &this.plugin.ports {
                 let i=port.index as usize;
                 let location=if port.audio{this.buffers[i].as_mut_ptr()}else if port.control{
                     let value=insert.controls.get(&port.symbol).copied().unwrap_or(port.default).clamp(port.min,port.max);
                     this.controls[i]=value;
                     if port.input{this.parameters.insert(port.symbol.clone(),Arc::new(AtomicU32::new(value.to_bits())));}
+                    if !port.input && !port.latency {this.meters.insert(port.symbol.clone(),Arc::new(AtomicU32::new(value.to_bits())));}
                     &mut this.controls[i]
                 }else{
                     // LV2 requires explicitly connecting unsupported optional
@@ -177,6 +209,7 @@ impl Instance {
         // SAFETY: instance and all connected buffers remain valid; only the audio thread calls run.
         unsafe {((*(*self.raw).descriptor).run)((*self.raw).handle,frames as u32);}
         self.host.end_run();
+        for port in &self.plugin.ports {if let Some(meter)=self.meters.get(&port.symbol){let value=self.controls[port.index as usize];meter.store(if value.is_finite(){value.to_bits()}else{0.0_f32.to_bits()},Ordering::Relaxed);}}
         let mut output=0;
         for port in &self.plugin.ports {if port.audio&&!port.input{channels[output][..frames].copy_from_slice(&self.buffers[port.index as usize][..frames]);output+=1;}}
     }

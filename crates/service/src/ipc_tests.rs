@@ -33,6 +33,7 @@ fn scanning_plugins_does_not_occupy_the_control_loop() {
         status: "Test".into(),
         peaks: vec![],
         channel_peaks: vec![],
+        plugin_meters: vec![],
     }));
     let (started_tx, started_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();

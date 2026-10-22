@@ -4,6 +4,7 @@ root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 if [[ $# != 1 ]]; then echo "Usage: $0 /path/to/alixer.rpm" >&2; exit 2; fi
 package="$(realpath -- "$1")"
 [[ "$(rpm -qp --qf '%{NAME}' "$package")" == alixer ]]
+rpm -qp --requires "$package" | rg -q '^(lv2-lsp-plugins|lsp-plugins-lv2)( |$)'
 mkdir -p "$root/target/rpm"
 extracted="$(mktemp -d "$root/target/rpm/check.XXXXXX")"
 rpm2cpio "$package" | (cd "$extracted" && cpio -idm --quiet)
@@ -21,6 +22,6 @@ desktop-file-validate "$extracted/usr/share/applications/org.alixer.Alixer.deskt
 export ALIXER_TEST_BIN_DIR="$extracted/usr/bin"
 python3 "$root/tests/runtime.py" --offline
 python3 "$root/tests/runtime.py"
-python3 "$root/tests/capture.py"
+ALIXER_TEST_LSP_EFFECTS=1 python3 "$root/tests/capture.py"
 echo "PASS: RPM payload, desktop entry, packaged activation, persistence and private live audio"
 echo "Extracted test files: $extracted"

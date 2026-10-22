@@ -7,7 +7,7 @@ egui GUI.
 
 - Channel strips for microphones, playback applications, groups, aux masters, and outputs.
 - Per-channel routing, mute/solo, and pre/post-fader aux sends.
-- LV2 insert effects with generic parameter controls.
+- Dedicated EQ, compressor and limiter editors, powered by LSP LV2 effects.
 - A persistent audio service, independent of the GUI.
 - A dark, customizable interface.
 
@@ -98,13 +98,23 @@ the same button in its inspector.
 
 Each strip has an insert rack above its buttons and fader.
 
-- **Add:** right-click empty rack space → **Add plugin…**, then search for an
-  effect matching the strip's channel count.
-- **Edit:** click an insert to open its generic controls in the inspector.
+- **Add:** right-click empty rack space → **Add effect…**, then choose Parametric EQ,
+  Compressor or Limiter. Mono and stereo strips use the matching LSP implementation.
+- **Edit:** click an insert to open its dedicated egui editor. Numeric values can
+  be typed directly; double-click a slider to restore its default.
+- **EQ:** select one of eight bands, drag its frequency/gain handle, and scroll
+  over a handle to adjust Q. Filter type, algorithm, slope, width, solo and mute
+  remain available. The plot shows band positions, not a simulated frequency response.
+- **Dynamics:** processing, timing, detector and signal controls are grouped by
+  function, with live input/output meters and gain-change history.
 - **Manage:** right-click an insert to bypass, reorder, or remove it.
 
-The picker only shows plugins supported by the host and the strip's channel
-layout. Plugin controls use Alixer's generic editor.
+Install the LSP **LV2** package for source builds (`lv2-lsp-plugins` on openSUSE,
+`lsp-plugins-lv2` on Fedora). RPM installations require it automatically. Alixer
+supports LSP Parametric Equalizer x8, Compressor and Limiter in mono/stereo;
+external sidechain inputs and LSP link routing are not exposed. Multichannel
+strips retain mixing and routing but cannot add these mono/stereo effects.
+Other effects in existing sessions remain playable, with a generic fallback editor.
 
 ## Outputs
 

@@ -226,6 +226,7 @@ mod tests {
                 status: String::new(),
                 peaks: vec![],
                 channel_peaks: vec![],
+                plugin_meters: vec![],
             };
             let mut this = Self {
                 app,
@@ -457,6 +458,7 @@ mod tests {
             status: String::new(),
             peaks: vec![],
             channel_peaks: vec![],
+            plugin_meters: vec![],
         };
         let ctx = egui::Context::default();
         let mut result = ctx.run_ui(

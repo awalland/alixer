@@ -1,5 +1,6 @@
 mod aux_sends;
 mod dev_service;
+mod effect_editor;
 mod fader;
 #[cfg(test)]
 mod ipc_tests;
@@ -447,7 +448,7 @@ impl App {
             }
         });
         ui.separator();
-        ui.label(RichText::new("LV2 INSERTS").small().color(MINT));
+        ui.label(RichText::new("INSERT EFFECTS").small().color(MINT));
         if self.selected_insert.is_some_and(|(s, _)| s == strip.id)
             && ui.small_button("Show all inserts").clicked()
         {
@@ -472,48 +473,9 @@ impl App {
                         bypass,
                     });
                 }
-                let plugin = self
-                    .catalog
-                    .as_array()
-                    .and_then(|list| list.iter().find(|p| p["uri"].as_str() == Some(&insert.uri)))
-                    .cloned();
-                if let Some(plugin) = plugin {
-                    if let Some(ports) = plugin["ports"].as_array() {
-                        for port in ports
-                            .iter()
-                            .filter(|p| p["input"] == true && p["control"] == true)
-                        {
-                            let symbol = port["symbol"].as_str().unwrap_or_default();
-                            let lo = port["min"].as_f64().unwrap_or(0.0) as f32;
-                            let hi = port["max"].as_f64().unwrap_or(1.0) as f32;
-                            let mut value = insert
-                                .controls
-                                .get(symbol)
-                                .copied()
-                                .unwrap_or(port["default"].as_f64().unwrap_or(0.0) as f32);
-                            let name = port["name"].as_str().unwrap_or(symbol);
-                            let changed = if port["toggle"] == true {
-                                let mut on = value > 0.0;
-                                let changed = ui.checkbox(&mut on, name).changed();
-                                value = if on { 1.0 } else { 0.0 };
-                                changed
-                            } else {
-                                let mut slider = egui::Slider::new(&mut value, lo..=hi).text(name);
-                                if port["integer"] == true {
-                                    slider = slider.integer();
-                                }
-                                ui.add(slider).changed()
-                            };
-                            if changed {
-                                self.edit(Edit::SetControl {
-                                    strip: strip.id,
-                                    insert: insert.id,
-                                    symbol: symbol.into(),
-                                    value,
-                                });
-                            }
-                        }
-                    }
+                if ui.button("Open editor…").clicked() {
+                    self.selected_insert = Some((strip.id, insert.id));
+                    self.ensure_catalog();
                 }
                 ui.horizontal(|ui| {
                     if ui.small_button("↑").clicked() {
@@ -536,7 +498,7 @@ impl App {
                 });
             });
         }
-        if ui.button("Add plugin…").clicked() {
+        if ui.button("Add effect…").clicked() {
             self.open_plugin_picker(strip.id);
         }
         if let Some(identity) = &strip.identity {
@@ -762,6 +724,7 @@ impl eframe::App for App {
         }
         if let Some(snapshot) = &snapshot {
             self.plugin_picker_window(&ctx, snapshot);
+            self.effect_editor_window(&ctx, snapshot);
             self.rename_strip_window(&ctx, snapshot);
         }
         if let Some(aux) = self.new_bus {
@@ -881,6 +844,7 @@ mod layout_tests {
                 status: String::new(),
                 peaks: vec![(strip.id, peak)],
                 channel_peaks: vec![],
+                plugin_meters: vec![],
             };
             let ctx = egui::Context::default();
             let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
@@ -972,6 +936,7 @@ mod layout_tests {
                 status: String::new(),
                 peaks: vec![(strip.id, 0.5)],
                 channel_peaks: vec![],
+                plugin_meters: vec![],
             };
             for width in [900.0, 2048.0] {
                 for height in [STRIP_MIN_HEIGHT, 720.0, 1000.0] {

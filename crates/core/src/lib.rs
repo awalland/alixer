@@ -1,4 +1,5 @@
 //! Persistent mixer intent and deterministic reconciliation. No audio or GUI dependencies.
+pub mod effects;
 #[cfg(test)]
 mod aux_tests;
 pub mod dsp;

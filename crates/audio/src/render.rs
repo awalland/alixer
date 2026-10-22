@@ -110,6 +110,7 @@ pub struct Render {
     controls: BTreeMap<Id, Arc<Controls>>,
     route_controls: BTreeMap<Id, Arc<RouteControls>>,
     parameters: BTreeMap<(Id, Id, String), Arc<AtomicU32>>,
+    meters: BTreeMap<(Id, Id, String), Arc<AtomicU32>>,
     pub name: String,
     input_names: BTreeMap<(Id, usize), String>,
     pub outputs: Vec<(String, usize, String)>,
@@ -244,6 +245,7 @@ impl Render {
             .collect();
         let mut effects = vec![];
         let mut parameters = BTreeMap::new();
+        let mut meters = BTreeMap::new();
         let mut warnings = vec![];
         for strip in &effective.strips {
             let mut chain = vec![];
@@ -262,6 +264,9 @@ impl Render {
                 };
                 for (symbol, value) in &instance.parameters {
                     parameters.insert((strip.id, insert.id, symbol.clone()), value.clone());
+                }
+                for (symbol, value) in &instance.meters {
+                    meters.insert((strip.id, insert.id, symbol.clone()), value.clone());
                 }
                 chain.push(instance);
             }
@@ -325,6 +330,7 @@ impl Render {
             controls,
             route_controls,
             parameters,
+            meters,
             name,
             input_names: BTreeMap::new(),
             outputs: vec![],
@@ -599,6 +605,8 @@ impl Render {
         self.route_controls = route_controls;
         self.parameters
             .retain(|(id, _, _), _| scene.strip(*id).is_some());
+        self.meters
+            .retain(|(id, _, _), _| scene.strip(*id).is_some());
         self.input_names = input_names;
         self.outputs = output_names;
         self.scene = scene.clone();
@@ -641,6 +649,18 @@ impl Render {
     }
     pub fn input_name(&self, id: Id, ch: usize) -> Option<String> {
         self.input_names.get(&(id, ch)).cloned()
+    }
+    pub fn plugin_meters(&self) -> Vec<(Id, String, f32)> {
+        self.meters
+            .iter()
+            .map(|((_, insert, symbol), value)| {
+                (
+                    *insert,
+                    symbol.clone(),
+                    f32::from_bits(value.load(Ordering::Relaxed)),
+                )
+            })
+            .collect()
     }
     pub fn peaks(&self) -> Vec<(Id, f32)> {
         self.controls

@@ -31,6 +31,12 @@ BuildRequires:  liblilv-0.so.0()(64bit)
 Requires:       pipewire
 Requires:       wireplumber >= 0.5
 Requires:       systemd
+# Dedicated Alixer editors use these LSP LV2 DSP implementations.
+%if 0%{?suse_version}
+Requires:       lv2-lsp-plugins
+%else
+Requires:       lsp-plugins-lv2
+%endif
 # Lilv and window-system libraries are loaded at runtime, so ELF dependency
 # generation alone cannot discover them. These names work across RPM distros.
 Requires:       liblilv-0.so.0()(64bit)

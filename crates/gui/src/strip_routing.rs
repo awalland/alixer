@@ -328,6 +328,7 @@ mod tests {
                 status: String::new(),
                 peaks: vec![],
                 channel_peaks: vec![],
+                plugin_meters: vec![],
             };
             let mut this = Self {
                 app,

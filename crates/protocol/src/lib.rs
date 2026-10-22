@@ -42,6 +42,9 @@ pub struct Snapshot {
     pub status: String,
     pub peaks: Vec<(Id, f32)>,
     pub channel_peaks: Vec<(Id, Vec<f32>)>,
+    /// Live output-control values keyed by insert UUID and LV2 port symbol.
+    #[serde(default)]
+    pub plugin_meters: Vec<(Id, String, f32)>,
 }
 impl Snapshot {
     pub fn stream_active(&self, strip: &Strip) -> bool {
