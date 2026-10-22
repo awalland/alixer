@@ -212,6 +212,7 @@ with tempfile.TemporaryDirectory(prefix="alixer-test-") as tmp:
             # Reproduce an upgrade with a surviving stream on its old Lixer
             # ingress. The logical strip ID stays the same across the rename.
             daemon.terminate();assert daemon.wait(timeout=5)==0
+            wait(lambda:not any(v["key"]=="alixer.saved-targets" for o in json.loads(command(["pw-dump"])) for v in o.get("metadata",[])),"desktop handoff completed before legacy upgrade simulation")
             legacy_ingress="lixer.input."+strip
             command(["pw-cli","create-node","adapter",'{ factory.name = support.null-audio-sink node.name = "'+legacy_ingress+'" media.class = Audio/Sink audio.position = [ FL FR ] object.linger = true lixer.strip = "'+strip+'" }'])
             graph=json.loads(command(["pw-dump"]))
@@ -276,8 +277,7 @@ with tempfile.TemporaryDirectory(prefix="alixer-test-") as tmp:
             command(["wpctl","set-volume",node,"0.4"])
             names_conf.unlink()
             command(["wpctl","set-mute",node,"0"])
-            graph=json.loads(command(["pw-dump"]))
-            assert any(o.get("info",{}).get("props",{}).get("node.name","").startswith("alixer.input.") for o in graph),"ingress must survive"
+            wait(lambda:not playback_sinks(),"stopping the service removes managed playback endpoints")
             daemon=spawn([str(BIN/"alixerd")])
             wait(snapshot,"service socket after restart")
             assert json.loads(names_conf.read_text())["monitor.alsa.rules"][0]["actions"]["update-props"]["node.description"]=="Desk speakers","service regenerates global rules from durable intent"

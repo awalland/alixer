@@ -2,6 +2,21 @@
 -- Does not change global fallback or forbid explicit moves to existing targets.
 local lutils = require ("linking-utils")
 local cutils = require ("common-utils")
+-- Client lifetime remains stable across DSP rebuilds and ends on both a
+-- graceful stop and a crash. Never hold desktop playback after it disappears.
+local engines = {}
+local function engine_running()
+  return next(engines) ~= nil
+end
+SimpleEventHook {
+  name = "alixer/engine-connected",
+  interests = { EventInterest { Constraint { "event.type", "=", "client-added" } } },
+  execute = function(event)
+    local client = event:get_subject()
+    if client.properties["application.id"] == "org.alixer.Engine" then engines[client.id] = true end
+  end,
+}:register()
+
 local function remembered_target(props)
   local metadata = cutils.get_default_metadata_object()
   local content = metadata and metadata:find(0, "alixer.saved-targets")
@@ -88,7 +103,7 @@ SimpleEventHook {
   },
   execute = function(event)
     local _, _, si, props, _, target = lutils:unwrap_select_target_event(event)
-    if is_system_sound(props, si) then return end
+    if not engine_running() or is_system_sound(props, si) then return end
     if target then return end
     local metadata = cutils.get_default_metadata_object()
     local requested = metadata and metadata:find(props["node.id"], "target.object")
@@ -118,5 +133,51 @@ SimpleEventHook {
       Constraint { "node.id", "=", props["event.subject.id"] },
     }
     if si then event:get_source():call("push-event", "select-target", si, nil) end
+  end,
+}:register()
+
+-- Release managed playback on disconnect, including old lingering endpoints
+-- created by earlier versions. Leave the virtual microphone silent so an
+-- attached recorder cannot unexpectedly fall back to a hardware microphone.
+SimpleEventHook {
+  name = "alixer/return-desktop-playback",
+  interests = { EventInterest { Constraint { "event.type", "=", "client-removed" } } },
+  execute = function(event)
+    local id = event:get_subject().id
+    if not engines[id] then return end
+    engines[id] = nil
+    if engine_running() then return end
+    local nodes = cutils.get_object_manager("node")
+    local metadata = cutils.get_default_metadata_object()
+    local owned_ids, owned_serials = {}, {}
+    local ingresses = {}
+    for node in nodes:iterate() do
+      local name = tostring(node.properties["node.name"] or "")
+      if name:match("^alixer%.input%.") or name:match("^lixer%.input%.") or name:match("^alixer%.event%.") then
+        owned_ids[tostring(node["bound-id"])] = true
+        owned_serials[tostring(node.properties["object.serial"])] = true
+        table.insert(ingresses, node)
+      end
+    end
+    if metadata then
+      metadata:set(0, "alixer.saved-targets", nil, nil)
+      for node in nodes:iterate() do
+        if node.properties["media.class"] == "Stream/Output/Audio" then
+          local id = node["bound-id"]
+          for _, key in ipairs({ "target.object", "target.node" }) do
+            local target = metadata:find(id, key)
+            local owned = key == "target.object" and owned_serials or owned_ids
+            if target and (owned[tostring(target)] or tostring(target):match("^alixer%.input%.")
+                or tostring(target):match("^lixer%.input%.") or tostring(target):match("^alixer%.event%.")) then
+              metadata:set(id, key, nil, nil)
+            end
+          end
+          metadata:set(id, "alixer.system-sounds.target", nil, nil)
+          metadata:set(id, "alixer.system-sounds.ready", nil, nil)
+        end
+      end
+    end
+    for _, node in ipairs(ingresses) do node:request_destroy() end
+    event:get_source():call("schedule-rescan", "linking")
   end,
 }:register()

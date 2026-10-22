@@ -44,8 +44,16 @@ preview filters, so opening or closing the GUI does not attach their capture
 clocks to playback.
 Playback sinks exist only while an application stream needs them, including while
 paused. Saved strips keep their settings without leaving unused output devices.
-Connected sinks survive service restarts; unused current and legacy sinks are
-collected automatically.
+Stopping or crashing the service releases playback to normal desktop routing
+and removes its playback sinks. The virtual microphone stays silent on ordinary
+shutdown so recording applications do not fall back to a hardware microphone.
+
+To stop using Alixer, run `alixerctl undeploy`. It stops and disables the service,
+removes current and legacy virtual devices and managed routing metadata, removes
+per-user integration and output-name rules, and restarts WirePlumber. Desktop
+audio may briefly pause during that restart. The virtual microphone is removed
+too, so recording applications return to desktop policy. Saved mixer settings
+are retained; device volumes and unrelated user settings are left as they are.
 
 ## Using the console
 

@@ -49,6 +49,10 @@ fn main() -> Result<()> {
                 "Integration installed. Run systemctl --user daemon-reload, restart WirePlumber, then enable --now alixer.service."
             );
         }
+        "undeploy" => {
+            integration::undeploy()?;
+            println!("Alixer stopped and disabled; devices, routes and integration removed. Saved mixer settings retained.");
+        }
         "disable" => {
             integration::configure(false)?;
             println!(
@@ -83,7 +87,7 @@ fn main() -> Result<()> {
                     restore: args.get(2).map(String::as_str) == Some("restore"),
                 },
                 _ => bail!(
-                    "Commands: snapshot, plugins, apply-output-names, edit JSON, resolve UUID keep|restore, diagnose, enable, disable"
+                    "Commands: snapshot, plugins, apply-output-names, edit JSON, resolve UUID keep|restore, diagnose, enable, disable, undeploy"
                 ),
             };
             let revision = if matches!(command, Command::Edit(_) | Command::Resolve { .. }) {

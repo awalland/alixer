@@ -152,7 +152,7 @@ with tempfile.TemporaryDirectory(prefix="alixer-events-") as tmp:
         spawn(["pipewire"])
         wait(lambda: (root / "run/pipewire-0").exists(), "PipeWire")
         command([str(BIN / "alixerctl"), "enable"])
-        spawn(["wireplumber"])
+        wp = spawn(["wireplumber"])
         spawn(["pipewire-pulse"])
         time.sleep(.8)
         for name in ("test.left", "test.right"):
@@ -245,13 +245,78 @@ with tempfile.TemporaryDirectory(prefix="alixer-events-") as tmp:
         assert len([o for o in graph if o.get("info", {}).get("props", {}).get("node.name", "").startswith("alixer.input.")]) == 1, "events must not leave saved playback sinks"
         wait(lambda: not any(o.get("info", {}).get("props", {}).get("node.name", "").startswith("alixer.event.")
                              for o in json.loads(command(["pw-dump"]))), "event endpoints collected")
-        daemon.terminate(); assert daemon.wait(timeout=5) == 0
+        music.terminate(); music.wait(timeout=5)
+        music = player("test.stop.music", "test.right", loud, "media.role = Music")
+        wait(lambda: len(snapshot()["active_streams"]) == 1, "managed music before shutdown")
+        time.sleep(.4)
+        music_id = snapshot()["active_streams"][0]
+        edit("Gain", strip=music_id, value=.25)
+        time.sleep(.2)
+        assert .05 < captured_peak(capture("test.right")) < .075
+        for crash in (False, True):
+            if crash:
+                daemon.kill()
+            else:
+                daemon.terminate()
+            assert daemon.wait(timeout=5) == (-9 if crash else 0)
+            wait(lambda: destinations("test.stop.music") == {"test.right"}, "desktop playback after stop/crash")
+            wait(lambda: not any(o.get("info", {}).get("props", {}).get("node.name", "").startswith(("alixer.input.", "lixer.input.", "alixer.event."))
+                                 for o in json.loads(command(["pw-dump"]))), "playback endpoints removed")
+            assert .22 < captured_peak(capture("test.right")) < .26, "music must continue without Alixer"
+            if not crash:
+                daemon = spawn([str(BIN / "alixerd")])
+                wait(snapshot, "service before crash")
+                time.sleep(.5)
+                assert .05 < captured_peak(capture("test.right")) < .075, "restart retains saved mixer gain"
+        music.terminate(); music.wait(timeout=5)
         recording = capture("test.right", 96000)
         time.sleep(.2)
         pulse = spawn(["paplay", "--device=test.right", "--property=media.role=event", str(short)])
         assert pulse.wait(timeout=5) == 0
         assert captured_peak(recording) > .15, "system sounds must play normally with the daemon stopped"
-        print("PASS: grouped event/Notification/event.id streams, independent destinations, shared gain/mute, short-sound admission, meters and persistence")
+        # Exercise undeploy without a desktop systemd instance. The real daemon
+        # still has to be stopped through its authenticated control socket.
+        tools = root / "tools"
+        tools.mkdir()
+        systemctl = tools / "systemctl"
+        systemctl.write_text('#!/bin/sh\nif [ "$2" = show ]; then echo not-found; fi\nexit 0\n')
+        systemctl.chmod(0o755)
+        env["PATH"] = str(tools) + ":" + env["PATH"]
+        daemon = spawn([str(BIN / "alixerd")])
+        wait(snapshot, "service before undeploy")
+        music = player("test.undeploy.music", "test.right", loud, "media.role = Music")
+        wait(lambda: len(snapshot()["active_streams"]) == 1, "music before undeploy")
+        time.sleep(.3)
+        command([str(BIN / "alixerctl"), "undeploy"])
+        assert daemon.wait(timeout=5) == 0
+        wait(lambda: destinations("test.undeploy.music") == {"test.right"}, "undeploy returns music to desktop")
+        assert .22 < captured_peak(capture("test.right")) < .26
+        assert not (conf / "90-alixer.conf").exists()
+        assert not (conf / "99-alixer-output-names.conf").exists()
+        assert not (root / "config/systemd/user/alixer.service").exists()
+        assert (root / "state/alixer").exists(), "undeploy retains mixer settings"
+        # Model the real restart requested by undeploy, unloading the guard.
+        wp.terminate(); wp.wait(timeout=5)
+        wp = spawn(["wireplumber"])
+        time.sleep(.8)
+        wait(lambda: destinations("test.undeploy.music") == {"test.right"}, "desktop policy without integration")
+        for name in ("lixer.input.orphan", "alixer.input.orphan", "alixer.microphone"):
+            command(["pw-cli", "create-node", "adapter", '{ factory.name = support.null-audio-sink node.name = "'+name+'" media.class = Audio/Sink audio.position = [ FL FR ] object.linger = true }'])
+        command(["pw-metadata", "-n", "default", "0", "alixer.saved-targets", "[]", "Spa:String:JSON"])
+        command(["pw-metadata", "-n", "default", "0", "test.keep", "untouched", "Spa:String"])
+        graph = json.loads(command(["pw-dump"]))
+        orphan = next(o for o in graph if o.get("info", {}).get("props", {}).get("node.name") == "lixer.input.orphan")
+        source = next(o["id"] for o in graph if o.get("info", {}).get("props", {}).get("node.name") == "test.undeploy.music")
+        command(["pw-metadata", "-n", "default", str(source), "target.object", str(orphan["info"]["props"]["object.serial"]), "Spa:Id"])
+        command(["pw-metadata", "-n", "default", "0", "default.configured.audio.sink", '{"name":"lixer.input.orphan"}', "Spa:String:JSON"])
+        command([str(BIN / "alixerctl"), "undeploy"])
+        wait(lambda: destinations("test.undeploy.music") == {"test.right"}, "legacy target references removed")
+        graph = json.loads(command(["pw-dump"]))
+        assert not any(o.get("info", {}).get("props", {}).get("node.name", "").startswith(("alixer.", "lixer.")) for o in graph)
+        metadata = next(o for o in graph if o["type"] == "PipeWire:Interface:Metadata" and o.get("props", {}).get("metadata.name") == "default")["metadata"]
+        assert not any(v["key"].startswith(("alixer.", "lixer.")) for v in metadata)
+        assert any(v["key"] == "test.keep" and v["value"] == "untouched" for v in metadata)
+        print("PASS: grouped event/Notification/event.id streams, independent destinations, shared gain/mute, short-sound admission, meters, persistence, stop/crash handoff and undeploy cleanup")
     except Exception:
         for index, log in enumerate(logs):
             log.flush(); log.seek(0)

@@ -160,3 +160,109 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 }
+
+/// Leave a normal desktop audio session, retaining saved mixer settings only.
+pub fn undeploy() -> Result<()> {
+    use std::{
+        os::{fd::AsRawFd, unix::net::UnixStream},
+        process::Command,
+        time::{Duration, Instant},
+    };
+    // Disable first: terminating a manually started daemon must not race systemd's restart.
+    for unit in ["alixer.service", "lixer.service"] {
+        let state = Command::new("systemctl")
+            .args(["--user", "show", unit, "--property=LoadState", "--value"])
+            .output()?;
+        if state.status.success() && String::from_utf8_lossy(&state.stdout).trim() == "loaded" {
+            let result = Command::new("systemctl")
+                .args(["--user", "disable", "--now", unit])
+                .output()?;
+            if !result.status.success() {
+                bail!(
+                    "Cannot disable {unit}: {}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+            }
+        }
+    }
+    let socket = alixer_protocol::runtime_dir().join("control.sock");
+    if let Ok(stream) = UnixStream::connect(&socket) {
+        let mut credentials: libc::ucred = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of_val(&credentials) as libc::socklen_t;
+        let result = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                (&mut credentials as *mut libc::ucred).cast(),
+                &mut len,
+            )
+        };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        if credentials.uid != unsafe { libc::getuid() } || credentials.pid <= 1 {
+            bail!("Refusing to stop an unrecognized service owner");
+        }
+        if unsafe { libc::kill(credentials.pid, libc::SIGTERM) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        drop(stream);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while UnixStream::connect(&socket).is_ok() {
+            if Instant::now() >= deadline {
+                bail!("Alixer did not stop; integration has been left installed");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    alixer_audio::cleanup::undeploy()?;
+    configure(false)?;
+    let config = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config")
+        });
+    let unit = config.join("systemd/user/alixer.service");
+    if managed_unit(&unit) {
+        remove_if_present(&unit)?;
+    }
+    for name in [
+        "99-alixer-output-names.conf",
+        "99-lixer-output-names.conf",
+        "90-lixer.conf",
+    ] {
+        remove_if_present(&config.join("wireplumber/wireplumber.conf.d").join(name))?;
+    }
+    let legacy_unit = config.join("systemd/user/lixer.service");
+    if std::fs::read_to_string(&legacy_unit)
+        .is_ok_and(|text| text.starts_with("[Unit]\nDescription=Lixer"))
+    {
+        remove_if_present(&legacy_unit)?;
+    }
+    let data = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/share")
+        });
+    let legacy_script = data.join("wireplumber/scripts/lixer-guard.lua");
+    if std::fs::read_to_string(&legacy_script)
+        .is_ok_and(|text| text.starts_with("-- Lixer") || text.starts_with("-- Alixer"))
+    {
+        remove_if_present(&legacy_script)?;
+    }
+    for args in [
+        vec!["--user", "daemon-reload"],
+        vec!["--user", "restart", "wireplumber.service"],
+    ] {
+        let result = Command::new("systemctl").args(&args).output()?;
+        if !result.status.success() {
+            bail!(
+                "Cleanup completed, but systemctl {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+    }
+    Ok(())
+}

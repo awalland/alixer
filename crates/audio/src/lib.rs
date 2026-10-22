@@ -1,4 +1,5 @@
 //! Native PipeWire graph observer and controller. All proxies stay on one thread.
+pub mod cleanup;
 mod render;
 mod system_sounds;
 use alixer_core::{reconcile::runtime_key, *};
@@ -901,8 +902,8 @@ fn run(
                     let exists=g.objects.values().any(|o|o.kind=="Node"&&o.props.get("node.name").map(String::as_str)==Some(MICROPHONE_KEY));
                     if !exists&&pending_ingresses.borrow_mut().insert(MICROPHONE_KEY.into()) {
                         let props=properties!{"factory.name"=>"support.null-audio-sink","node.name"=>MICROPHONE_KEY,"node.description"=>"Alixer Microphone","media.class"=>"Audio/Source/Virtual","audio.channels"=>"2","audio.position"=>"[ FL FR ]","monitor.passthrough"=>"true","node.virtual"=>"true","object.linger"=>"true","priority.session"=>"-1000","monitor.channel-volumes"=>"false"};
-                        // Retain a silent endpoint on shutdown, just like playback
-                        // ingresses. Recorders must not fall back to the raw mic.
+                        // Retain a silent endpoint on ordinary shutdown.
+                        // Explicit undeploy removes it; recorders otherwise stay private.
                         match core.create_object::<pw::node::Node>("adapter",&props){Ok(node)=>{ingresses.insert(MICROPHONE_KEY.into(),node);},Err(e)=>{*render_error=e.to_string();pending_ingresses.borrow_mut().remove(MICROPHONE_KEY);}}
                     }
                 }
@@ -926,7 +927,7 @@ fn run(
                     let name=format!("alixer.input.{}",strip.id);
                     let ingress=g.objects.iter().find(|(_,o)|o.kind=="Node"&&o.props.get("node.name")==Some(&name)).map(|(id,_)|*id);
                     if ingress.is_none()&&pending_ingresses.borrow_mut().insert(name.clone()) {
-                        let props=properties!{"factory.name"=>"support.null-audio-sink","node.name"=>name.clone(),"node.description"=>format!("Alixer · {}",strip.name),"media.class"=>"Audio/Sink","node.driver"=>"false","audio.channels"=>strip.channels.len().to_string(),"audio.position"=>format!("[ {} ]",strip.channels.join(" ")),"object.linger"=>"true","node.virtual"=>"true","priority.session"=>"-1000","alixer.strip"=>strip.id.to_string(),"monitor.channel-volumes"=>"false"};
+                        let props=properties!{"factory.name"=>"support.null-audio-sink","node.name"=>name.clone(),"node.description"=>format!("Alixer · {}",strip.name),"media.class"=>"Audio/Sink","node.driver"=>"false","audio.channels"=>strip.channels.len().to_string(),"audio.position"=>format!("[ {} ]",strip.channels.join(" ")),"object.linger"=>"false","node.virtual"=>"true","priority.session"=>"-1000","alixer.strip"=>strip.id.to_string(),"monitor.channel-volumes"=>"false"};
                         match core.create_object::<pw::node::Node>("adapter",&props){Ok(node)=>{ingresses.insert(name.clone(),node);},Err(e)=>{*render_error=e.to_string();pending_ingresses.borrow_mut().remove(&name);}}
                     }
                     let Some(ingress)=ingress else{continue};
