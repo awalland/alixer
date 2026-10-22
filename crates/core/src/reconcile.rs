@@ -19,8 +19,8 @@ pub fn runtime_key(id: &RuntimeId) -> String {
     format!("{}:{}", id.epoch, id.serial)
 }
 
-/// Absent nodes have no deletion semantics. Only comparable, surviving incarnations
-/// can provide evidence that a route was removed while the controller was offline.
+/// Absent or recreated nodes have no deletion semantics. Only comparable, surviving
+/// incarnations can provide evidence that a route was removed while the controller was offline.
 pub fn reconcile(
     saved: &Scene,
     baseline: &Checkpoint,
@@ -29,7 +29,15 @@ pub fn reconcile(
 ) -> Reconciled {
     let mut result = Reconciled {
         scene: saved.clone(),
-        conflicts: existing.to_vec(),
+        // Older versions suspended recreated streams until "Restore saved" was chosen.
+        // Drop those persisted conflicts so saved routing resumes automatically.
+        conflicts: existing
+            .iter()
+            .filter(|c| {
+                c.message != "Stream was recreated; outside routing intent cannot be inferred"
+            })
+            .cloned()
+            .collect(),
         bindings: BTreeMap::new(),
         external: BTreeMap::new(),
     };
@@ -238,7 +246,9 @@ pub fn reconcile(
         {
             continue;
         }
-        let has_saved = saved.strip(id).is_some();
+        // A recreated stream's initial targets come from the session manager, not
+        // evidence of an outside edit. Without a previous incarnation, keep its
+        // saved routes and let the mixer reclaim it.
         if let Some(previous) = previous {
             if previous.targets != stream.targets && !stream.targets.is_empty() {
                 // A change with all targets available and no old target loss is unambiguous
@@ -267,13 +277,6 @@ pub fn reconcile(
                     &stream.targets,
                 );
             }
-        } else if has_saved && !stream.targets.is_empty() {
-            conflict(
-                &mut result.conflicts,
-                Some(id),
-                "Stream was recreated; outside routing intent cannot be inferred",
-                &stream.targets,
-            );
         }
     }
     if result.scene != *saved {
@@ -465,14 +468,86 @@ mod tests {
         assert_eq!(first.scene, next.scene);
     }
     #[test]
-    fn recreated_stream_has_a_conflict_instead_of_duplicate_audio() {
+    fn surviving_stream_disconnect_still_requires_resolution() {
+        let mut actual = Observation {
+            streams: vec![stream()],
+            ..Default::default()
+        };
+        let first = reconcile(&Scene::default(), &Checkpoint::default(), &actual, &[]);
+        let baseline = Checkpoint {
+            observation: actual.clone(),
+            bindings: first.bindings,
+        };
+        actual.streams[0].targets.clear();
+        let next = reconcile(&first.scene, &baseline, &actual, &[]);
+        assert_eq!(next.scene, first.scene);
+        assert_eq!(next.conflicts.len(), 1);
+        assert_eq!(next.conflicts[0].strip, Some(first.scene.strips[0].id));
+        assert!(next.conflicts[0].current.is_empty());
+    }
+    #[test]
+    fn recreated_stream_restores_saved_mix_automatically() {
         let actual = Observation {
             streams: vec![stream()],
             outputs: vec![],
             ..Default::default()
         };
         let first = reconcile(&Scene::default(), &Checkpoint::default(), &actual, &[]);
-        let next = reconcile(&first.scene, &Checkpoint::default(), &actual, &[]);
-        assert_eq!(next.conflicts.len(), 1);
+        let mut saved = first.scene;
+        let id = saved.strips[0].id;
+        saved
+            .edit(Edit::Gain {
+                strip: id,
+                value: 0.3,
+            })
+            .unwrap();
+        let baseline = Checkpoint {
+            observation: actual.clone(),
+            bindings: first.bindings,
+        };
+        let mut returned = actual.clone();
+        returned.streams[0].runtime.serial = "43".into();
+        returned.streams[0].targets = vec![("headphones".into(), 0, 0)];
+        for checkpoint in [baseline, Checkpoint::default()] {
+            let next = reconcile(&saved, &checkpoint, &returned, &[]);
+            assert!(next.conflicts.is_empty());
+            assert_eq!(next.scene, saved);
+            assert_eq!(
+                next.bindings[&runtime_key(&returned.streams[0].runtime)],
+                id
+            );
+        }
+    }
+
+    #[test]
+    fn persisted_recreation_conflicts_are_cleared_without_losing_other_conflicts() {
+        let actual = Observation {
+            streams: vec![stream()],
+            ..Default::default()
+        };
+        let first = reconcile(&Scene::default(), &Checkpoint::default(), &actual, &[]);
+        let id = first.scene.strips[0].id;
+        let mut existing = vec![];
+        conflict(
+            &mut existing,
+            Some(id),
+            "Stream was recreated; outside routing intent cannot be inferred",
+            &actual.streams[0].targets,
+        );
+        conflict(
+            &mut existing,
+            Some(id),
+            "Stream is disconnected; preserve current silence until resolved",
+            &[],
+        );
+        // Cleanup also works while streams are absent, before they return.
+        let next = reconcile(
+            &first.scene,
+            &Checkpoint::default(),
+            &Observation::default(),
+            &existing,
+        );
+        assert_eq!(next.scene, first.scene);
+        assert_eq!(next.conflicts, existing[1..]);
     }
 }

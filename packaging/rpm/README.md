@@ -30,7 +30,7 @@ runtime dependencies optional. `--prepare-only` generates inputs without buildin
 Install the matching binary RPM with zypper (replace the filename as needed):
 
 ```sh
-sudo zypper install ./target/rpm/RPMS/x86_64/alixer-0.2.1-1.x86_64.rpm
+sudo zypper install ./target/rpm/RPMS/x86_64/alixer-0.2.2-1.x86_64.rpm
 alixerctl enable
 systemctl --user daemon-reload
 systemctl --user restart wireplumber.service
