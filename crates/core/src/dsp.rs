@@ -164,9 +164,13 @@ impl Processor {
         })
     }
     pub fn clear(&mut self) {
+        self.clear_frames(self.max_frames);
+    }
+    pub fn clear_frames(&mut self, frames: usize) {
+        assert!(frames <= self.max_frames);
         for strip in &mut self.pre {
             for channel in strip {
-                channel.fill(0.0);
+                channel[..frames].fill(0.0);
             }
         }
     }
@@ -351,6 +355,33 @@ impl Processor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn clearing_variable_blocks_does_not_replay_stale_input() {
+        let source = Strip::new("input", StripKind::Stream, vec!["MONO".into()]);
+        let id = source.id;
+        let mut scene = Scene::default();
+        scene.strips.push(source);
+        scene.routes.push(Route {
+            id: Id::new_v4(),
+            source: id,
+            destination: Destination::Output("out".into()),
+            source_channel: 0,
+            target_channel: 0,
+            gain: 1.0,
+            tap: Tap::Post,
+        });
+        let mut dsp = Processor::new(scene, 512).unwrap();
+        dsp.input(id, 0).unwrap().fill(1.0);
+        dsp.process(512, 48000.0);
+        // A disconnected input, first at a small quantum and then a larger one.
+        for frames in [32, 512, 64] {
+            dsp.clear_frames(frames);
+            dsp.process(frames, 48000.0);
+            let mut output = vec![1.0; frames];
+            dsp.output("out", 0, &mut output);
+            assert!(output.iter().all(|&v| v == 0.0));
+        }
+    }
     #[test]
     fn plan_handover_preserves_ramps_and_latency_history() {
         let mut scene = Scene::default();

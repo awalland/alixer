@@ -111,6 +111,23 @@ with tempfile.TemporaryDirectory(prefix="alixer-capture-") as tmp:
         assert mic["color"] == [224, 164, 62]
         assert not scene["routes"], "microphones must start without speaker or virtual-mic routes"
         wait(lambda: any(p[0] == mic["id"] and p[1] > .1 for p in snapshot()["peaks"]), "input audio meter")
+        def engine_idle():
+            engines = [o["info"] for o in json.loads(command(["pw-dump"]))
+                       if o.get("info", {}).get("props", {}).get("node.name", "").startswith("alixer.engine.")]
+            return engines and all(e["state"] in ("idle", "suspended") for e in engines)
+
+        wait(engine_idle, "unrouted microphone sleeps after one-shot meter request")
+        with socket.socket(socket.AF_UNIX) as ui:
+            ui.settimeout(5)
+            ui.connect(str(root / "run/alixer/control.sock"))
+            ui.sendall((json.dumps(dict(version=6, id=1, revision=None,
+                                       command=dict(type="Subscribe"))) + "\n").encode())
+            with ui.makefile() as frames:
+                def input_meter():
+                    value = json.loads(frames.readline())["result"]["Ok"]["value"]
+                    return any(id == mic["id"] and peak > .1 for id, peak in value["peaks"])
+                wait(input_meter, "UI subscription enables unrouted input meters")
+        wait(engine_idle, "closing UI releases microphone preview links")
         wait(lambda: any(s["name"] == "alixer.microphone" for s in json.loads(command(["pactl", "--format=json", "list", "sources"]))), "virtual microphone exposed to PulseAudio clients")
         assert record_peak() < .0001, "unrouted virtual microphone must be silent"
         for channel in range(2):
@@ -163,6 +180,11 @@ with tempfile.TemporaryDirectory(prefix="alixer-capture-") as tmp:
         wait(lambda: any(p[0] == master["id"] and p[1] > .09 for p in snapshot()["peaks"]), "saved capture routes restored")
         wait(lambda: meeting_sources() == {"alixer.microphone"}, "meeting reconnected after service restart")
         assert .09 < record_peak() < .15
+        meeting.terminate()
+        meeting.wait(timeout=5)
+        for route in snapshot()["scene"]["routes"]:
+            edit(dict(type="RemoveRoute", route=route["id"]))
+        wait(engine_idle, "removing the final microphone route releases its hardware links")
         print("PASS: input discovery, amber strips, silent defaults, PulseAudio source, captured samples, gain/mute, hotplug and persistence")
     except Exception:
         for index, log in enumerate(logs):

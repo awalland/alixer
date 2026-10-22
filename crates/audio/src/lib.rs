@@ -11,7 +11,7 @@ use std::{
     rc::Rc,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     },
     time::Duration,
@@ -87,6 +87,23 @@ pub struct Update {
     pub channel_peaks: Vec<(Id, Vec<f32>)>,
     pub states: Vec<PluginState>,
 }
+/// Metering follows consumers, rather than the lifetime of the audio engine.
+#[derive(Default)]
+pub struct Metering {
+    pub subscribers: AtomicUsize,
+    requested: AtomicBool,
+}
+impl Metering {
+    pub fn request(&self) {
+        self.requested.store(true, Ordering::Relaxed);
+    }
+    pub fn enabled(&self) -> bool {
+        self.subscribers.load(Ordering::Relaxed) > 0 || self.requested.load(Ordering::Relaxed)
+    }
+    fn clear_request(&self) {
+        self.requested.store(false, Ordering::Relaxed);
+    }
+}
 pub struct Backend {
     pub commands: mpsc::Sender<Apply>,
     pub updates: mpsc::Receiver<Update>,
@@ -94,7 +111,7 @@ pub struct Backend {
     thread: Option<std::thread::JoinHandle<Vec<PluginState>>>,
 }
 impl Backend {
-    pub fn start() -> Self {
+    pub fn start(metering: Arc<Metering>) -> Self {
         let (commands, rx) = mpsc::channel();
         let (tx, updates) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
@@ -105,7 +122,7 @@ impl Backend {
                 if stopping.load(Ordering::Acquire) {
                     return vec![];
                 }
-                match run(rx.clone(), tx.clone(), stopping.clone()) {
+                match run(rx.clone(), tx.clone(), stopping.clone(), metering.clone()) {
                     Ok(states) => return states,
                     Err(e) => {
                         let _ = tx.send(Update {
@@ -151,6 +168,7 @@ struct Raw {
 }
 #[derive(Default)]
 struct Graph {
+    dirty: bool,
     objects: BTreeMap<u32, Raw>,
     epoch: String,
     targets: BTreeMap<u32, String>,
@@ -216,14 +234,19 @@ impl Graph {
             if name.starts_with("alixer.") || name.starts_with("lixer.") {
                 continue;
             }
-            if matches!(class, "Audio/Source" | "Audio/Source/Virtual") && !name.ends_with(".monitor")
+            if matches!(class, "Audio/Source" | "Audio/Source/Virtual")
+                && !name.ends_with(".monitor")
                 && node.props.get("device.class").map(String::as_str) != Some("monitor")
             {
                 let ports = self.ports(id, true);
                 if !ports.is_empty() {
                     result.inputs.push(Input {
                         key: name,
-                        name: node.props.get("node.description").cloned().unwrap_or_default(),
+                        name: node
+                            .props
+                            .get("node.description")
+                            .cloned()
+                            .unwrap_or_default(),
                         channels: ports.iter().map(|p| p.2.clone()).collect(),
                     });
                 }
@@ -364,6 +387,7 @@ fn run(
     rx: Rc<mpsc::Receiver<Apply>>,
     tx: mpsc::Sender<Update>,
     stop: Arc<AtomicBool>,
+    metering: Arc<Metering>,
 ) -> Result<Vec<PluginState>> {
     pw::init();
     let mainloop = pw::main_loop::MainLoopRc::new(None)?;
@@ -385,7 +409,9 @@ fn run(
     let _core_listener = core
         .add_listener_local()
         .info(move |info| {
-            g.borrow_mut().epoch = info.cookie().to_string();
+            let mut graph = g.borrow_mut();
+            graph.epoch = info.cookie().to_string();
+            graph.dirty = true;
         })
         .done(move |_, _| {
             r.set(true);
@@ -416,6 +442,7 @@ fn run(
             };
             let props: BTreeMap<String, String> =
                 props.iter().map(|(k, v)| (k.into(), v.into())).collect();
+            g.borrow_mut().dirty = true;
             g.borrow_mut().objects.insert(
                 obj.id,
                 Raw {
@@ -437,6 +464,7 @@ fn run(
                 let listener = node
                     .add_listener_local()
                     .info(move |info| {
+                        ginfo.borrow_mut().dirty = true;
                         if let Some(properties) = info.props() {
                             if let Some(raw) = ginfo.borrow_mut().objects.get_mut(&id) {
                                 for (k, v) in properties.iter() {
@@ -447,6 +475,7 @@ fn run(
                     })
                     .param(move |_, _, _, _, pod| {
                         let Some(pod) = pod else { return };
+                        gparam.borrow_mut().dirty = true;
                         if let Ok((_, pw::spa::pod::Value::Object(value))) =
                             pw::spa::pod::deserialize::PodDeserializer::deserialize_any_from(
                                 pod.as_bytes(),
@@ -488,6 +517,7 @@ fn run(
                         .add_listener_local()
                         .property(move |subject, key, _, value| {
                             if key == Some("target.object") {
+                                graph.borrow_mut().dirty = true;
                                 if let Some(value) = value {
                                     graph.borrow_mut().targets.insert(subject, value.into());
                                 } else {
@@ -506,6 +536,7 @@ fn run(
             let g = graph.clone();
             let keep = proxies.clone();
             move |id| {
+                g.borrow_mut().dirty = true;
                 g.borrow_mut().objects.remove(&id);
                 keep.borrow_mut().remove(&id);
             }
@@ -516,8 +547,7 @@ fn run(
         desired: Option<Apply>,
         render: Option<render::Render>,
         signature: String,
-        links: Vec<pw::link::Link>,
-        linked: BTreeSet<(u32, u32)>,
+        links: BTreeMap<(u32, u32), pw::link::Link>,
         ingresses: Vec<pw::node::Node>,
         requested: BTreeSet<Id>,
         render_error: String,
@@ -528,8 +558,7 @@ fn run(
         desired: None,
         render: None,
         signature: String::new(),
-        links: vec![],
-        linked: BTreeSet::new(),
+        links: BTreeMap::new(),
         ingresses: vec![],
         requested: BTreeSet::new(),
         render_error: String::new(),
@@ -540,13 +569,30 @@ fn run(
     // Timer callbacks are on the control thread; FFI process callbacks never touch this state.
     let loop_quit = mainloop.clone();
     let updates = tx.clone();
+    struct Activity {
+        observation: Observation,
+        topology_pending: bool,
+        had_consumers: bool,
+        latency_overflow: bool,
+    }
+    let activity = RefCell::new(Activity {
+        observation: Observation::default(),
+        topology_pending: true,
+        had_consumers: false,
+        latency_overflow: false,
+    });
     let timer=mainloop.loop_().add_timer(move|_|{
         if stop.load(Ordering::Acquire){loop_quit.quit();return;}
         if !ready.get(){return;}
+        let mut activity = activity.borrow_mut();
+        let Activity { observation: previous_observation, topology_pending, had_consumers, latency_overflow: previous_overflow } = &mut *activity;
+        let graph_changed = std::mem::take(&mut graph.borrow_mut().dirty);
+        let mut command_changed = false;
         let mut state=controller.borrow_mut();
-        let Controller{desired,render,signature,links,linked,ingresses,requested,render_error,states,rate}=&mut *state;
-        if let Some(current)=render.as_mut(){current.reclaim();let observed=current.rate();if observed>0&&observed!=*rate{*rate=observed;signature.clear();}}
+        let Controller{desired,render,signature,links,ingresses,requested,render_error,states,rate}=&mut *state;
+        if let Some(current)=render.as_mut(){current.reclaim();let observed=current.rate();if observed>0&&observed!=*rate{*rate=observed;signature.clear();*topology_pending=true;}}
         while let Ok(mut command)=rx.try_recv(){
+            command_changed = true;
             for control in command.output_controls.drain(..){
                 let g=graph.borrow();
                 if let Some((&id,raw))=g.objects.iter().find(|(_,o)|o.kind=="Node"&&o.props.get("node.name")==Some(&control.key)){
@@ -555,7 +601,14 @@ fn run(
             }
             *desired=Some(command);
         }
-        if let Some(apply)=desired.as_ref() {
+        let metering_enabled = metering.enabled();
+        let has_consumers = metering_enabled;
+        let latency_overflow = render.as_ref().is_some_and(|r| r.latency_overflow());
+        let needs_work = latency_overflow != *previous_overflow || has_consumers != *had_consumers || graph_changed || command_changed || *topology_pending || !render_error.is_empty();
+        if !needs_work && !metering_enabled { return; }
+        *had_consumers = has_consumers;
+        *previous_overflow = latency_overflow;
+        if needs_work { if let Some(apply)=desired.as_ref() {
             let key=topology_signature(apply);
             if *signature!=key {
                 let rebuild=if let Some(current)=render.as_mut(){
@@ -567,23 +620,25 @@ fn run(
                     }
                 }else{true};
                 if rebuild {
-                links.clear();linked.clear();
+                links.clear();
                 let mut scene=apply.scene.clone();
                 if let Some(mut old)=render.take(){
                     let captured=old.checkpoint(&apply.state_dir);
                     for captured in &captured{if let Some(strip)=scene.strips.iter_mut().find(|s|s.id==captured.strip){if let Some(slot)=strip.inserts.iter_mut().find(|s|s.id==captured.insert){slot.state=Some(captured.path.clone());}}}
                     states.extend(captured);
                 }
-                match render::Render::new(&core,&scene,&apply.suspended,*rate) {
-                    Ok(new)=>{*render=Some(new);render_error.clear();*signature=key;}
+                match render::Render::new(&core,&scene,&apply.suspended,*rate,metering.clone()) {
+                    Ok(new)=>{*render=Some(new);render_error.clear();*signature=key.clone();}
                     Err(e)=>{*render_error=format!("{e:#}");}
                 }
                 }
             }
+            *topology_pending = *signature != key;
             if let Some(render)=render.as_mut() {
                 render.update_controls(&apply.scene);
                 let g=graph.borrow();
-                linked.retain(|(source,target)|g.objects.values().any(|o|o.kind=="Link"&&o.props.get("link.output.port").and_then(|v|v.parse::<u32>().ok())==Some(*source)&&o.props.get("link.input.port").and_then(|v|v.parse::<u32>().ok())==Some(*target)));
+                links.retain(|(source,target),_|g.objects.values().any(|o|o.kind=="Link"&&o.props.get("link.output.port").and_then(|v|v.parse::<u32>().ok())==Some(*source)&&o.props.get("link.input.port").and_then(|v|v.parse::<u32>().ok())==Some(*target)));
+                let mut linked = BTreeSet::new();
                 for strip in apply.scene.strips.iter().filter(|s|s.kind==StripKind::VirtualMic) {
                     let exists=g.objects.values().any(|o|o.kind=="Node"&&o.props.get("node.name").map(String::as_str)==Some(MICROPHONE_KEY));
                     if !exists&&requested.insert(strip.id) {
@@ -594,6 +649,8 @@ fn run(
                     }
                 }
                 for strip in apply.scene.strips.iter().filter(|s|s.kind==StripKind::Input) {
+                    // Unrouted hardware inputs must not keep the whole graph awake.
+                    if !has_consumers && !apply.scene.routes.iter().any(|r| r.source == strip.id) { continue; }
                     let Some(source)=strip.input_key.as_ref() else{continue};
                     if let Some((&id,_))=g.objects.iter().find(|(_,o)|o.kind=="Node"&&o.props.get("node.name")==Some(source)) {
                         let ports=g.ports(id,true);
@@ -601,7 +658,7 @@ fn run(
                             let matches:Vec<_>=ports.iter().filter(|(_,_,channel)|channel==expected).collect();
                             let port=ports.get(ch).filter(|(_,_,channel)|channel==expected).or_else(||if matches.len()==1{Some(matches[0])}else{None});
                             if let (Some((_,port,_)),Some(input))=(port,render.input_name(strip.id,ch)) {
-                                wire(&core,&g,linked,links,source,port,&render.name,&input);
+                                wire(&core,&g,&mut linked,links,source,port,&render.name,&input);
                             }
                         }
                     }
@@ -629,7 +686,7 @@ fn run(
                     let monitors=g.ports(ingress,true);
                     for (ch,(_,port,_)) in monitors.iter().enumerate() {
                         if let Some(input)=render.input_name(strip.id,ch){
-                            wire(&core,&g,linked,links,&name,port,&render.name,&input);
+                            wire(&core,&g,&mut linked,links,&name,port,&render.name,&input);
                         }
                     }
                 }
@@ -643,15 +700,20 @@ fn run(
                                 let first=matches.next();if matches.next().is_none(){first}else{None}
                             })
                         }else{ports.get(*ch)};
-                        if let Some((_,target,_))=target{wire(&core,&g,linked,links,&render.name,port,output,target);}
+                        if let Some((_,target,_))=target{wire(&core,&g,&mut linked,links,&render.name,port,output,target);}
                     }
                 }
+                links.retain(|ports, _| linked.contains(ports));
             }
         }
-        let observation=graph.borrow().observation();
+        }
+        if needs_work { *previous_observation = graph.borrow().observation(); }
+        let observation=previous_observation.clone();
         let status=if !render_error.is_empty(){format!("Audio error: {render_error}")}else if let Some(render)=render.as_ref(){if render.latency_overflow(){"Audio error: plugin compensation exceeds 16384 frames; outputs silenced".into()}else if !render.warnings.is_empty(){format!("Connected · unavailable inserts bypassed: {}",render.warnings.join("; "))}else{format!("Connected to PipeWire · {rate} Hz")}}else{"Connected to PipeWire".into()};
+        metering.clear_request();
         let peaks=render.as_ref().map(|r|r.peaks()).unwrap_or_default();
         let channel_peaks=render.as_ref().map(|r|r.channel_peaks()).unwrap_or_default();
+
         if updates.send(Update{observation,status,peaks,channel_peaks,states:std::mem::take(states)}).is_err(){loop_quit.quit();}
     });
     timer
@@ -787,8 +849,14 @@ mod tests {
             output_controls: vec![],
         };
         let signature = topology_signature(&apply);
-        apply.bindings.insert("server:new-stream-incarnation".into(), source.id);
-        assert_eq!(topology_signature(&apply), signature, "runtime bindings do not change the DSP graph");
+        apply
+            .bindings
+            .insert("server:new-stream-incarnation".into(), source.id);
+        assert_eq!(
+            topology_signature(&apply),
+            signature,
+            "runtime bindings do not change the DSP graph"
+        );
         for edit in [
             Edit::Color {
                 strip: source.id,
@@ -875,7 +943,7 @@ fn wire(
     core: &pw::core::CoreRc,
     g: &Graph,
     linked: &mut BTreeSet<(u32, u32)>,
-    links: &mut Vec<pw::link::Link>,
+    links: &mut BTreeMap<(u32, u32), pw::link::Link>,
     source: &str,
     source_port: &str,
     target: &str,
@@ -901,8 +969,9 @@ fn wire(
     let (Some(sp), Some(tp)) = (port(sn, true, source_port), port(tn, false, target_port)) else {
         return;
     };
-    if linked.contains(&(sp, tp)) {
+    linked.insert((sp, tp));
+    if links.contains_key(&(sp, tp)) {
         return;
     }
-    if let Ok(link)=core.create_object::<pw::link::Link>("link-factory",&properties!{"link.output.port"=>sp.to_string(),"link.input.port"=>tp.to_string(),"object.linger"=>"false"}) {linked.insert((sp,tp));links.push(link);}
+    if let Ok(link)=core.create_object::<pw::link::Link>("link-factory",&properties!{"link.output.port"=>sp.to_string(),"link.input.port"=>tp.to_string(),"object.linger"=>"false"}) {links.insert((sp,tp),link);}
 }

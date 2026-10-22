@@ -25,7 +25,7 @@ fn reply(stream: &mut UnixStream) -> Reply {
 #[test]
 fn scanning_plugins_does_not_occupy_the_control_loop() {
     let (tx, rx) = mpsc::sync_channel(32);
-    let public = Arc::new(Mutex::new(Snapshot {
+    let public = Arc::new(Published::new(Snapshot {
         active_streams: None,
         scene: Scene::default(),
         observation: Observation::default(),
@@ -80,4 +80,32 @@ fn scanning_plugins_does_not_occupy_the_control_loop() {
     drop(catalog_client);
     control.join().unwrap().unwrap();
     scan.join().unwrap().unwrap();
+}
+
+#[test]
+fn subscription_releases_metering_when_the_client_disconnects() {
+    let (tx, _rx) = mpsc::sync_channel(32);
+    let public = Arc::new(Published::new(Snapshot {
+        active_streams: None,
+        scene: Scene::default(),
+        observation: Observation::default(),
+        conflicts: vec![],
+        status: "Test".into(),
+        peaks: vec![],
+        channel_peaks: vec![],
+    }));
+    assert!(!public.metering.enabled());
+    let (mut client, server) = UnixStream::pair().unwrap();
+    let worker_public = public.clone();
+    let worker = std::thread::spawn(move || serve(server, tx, worker_public));
+    request(&mut client, Command::Subscribe);
+    assert!(matches!(
+        reply(&mut client).result,
+        Ok(Payload::Snapshot(_))
+    ));
+    assert!(public.metering.enabled());
+    client.shutdown(std::net::Shutdown::Both).unwrap();
+    drop(client);
+    assert!(worker.join().unwrap().is_err());
+    assert!(!public.metering.enabled());
 }
