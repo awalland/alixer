@@ -155,6 +155,16 @@ pub fn reconcile(
             result.scene.strips.push(strip);
         }
     }
+    // Old releases saved individual event strips. Replace those with one
+    // persistent controller, leaving ordinary applications and their mix intact.
+    let old_events: BTreeSet<_> = result.scene.strips.iter()
+        .filter(|s| s.kind == StripKind::Stream && s.identity.as_ref().is_some_and(Identity::is_system_sound))
+        .map(|s| s.id).collect();
+    result.scene.strips.retain(|s| !old_events.contains(&s.id));
+    result.scene.routes.retain(|r| !old_events.contains(&r.source));
+    result.conflicts.retain(|c| c.strip.is_none_or(|id| !old_events.contains(&id)));
+    let system = result.scene.strips.iter().find(|s| s.kind == StripKind::SystemSounds)
+        .cloned().unwrap_or_else(|| Strip::new("System sounds", StripKind::SystemSounds, vec!["FL".into(), "FR".into()]));
     let mut claimed = BTreeSet::new();
     let reserved: BTreeMap<Id, String> = actual
         .streams
@@ -166,6 +176,10 @@ pub fn reconcile(
         .collect();
     for stream in &actual.streams {
         let key = runtime_key(&stream.runtime);
+        if stream.identity.is_system_sound() {
+            result.bindings.insert(key, system.id);
+            continue;
+        }
         let exact = baseline
             .bindings
             .get(&key)
@@ -279,6 +293,9 @@ pub fn reconcile(
             }
         }
     }
+    if !result.scene.strips.iter().any(|s| s.kind == StripKind::SystemSounds) {
+        result.scene.strips.push(system);
+    }
     if result.scene != *saved {
         result.scene.revision = saved.revision + 1;
     }
@@ -386,7 +403,7 @@ mod tests {
         assert_eq!(master.name, "Desk");
         assert_eq!(master.gain, 0.2);
         assert!(!master.mute);
-        assert_eq!(returned.scene.strips.len(), 1);
+        assert_eq!(returned.scene.strips.iter().filter(|s| s.kind == StripKind::Output).count(), 1);
     }
     fn stream() -> StreamObservation {
         StreamObservation {

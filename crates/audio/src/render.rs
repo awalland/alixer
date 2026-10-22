@@ -59,6 +59,7 @@ impl Drop for Handoff {
 
 struct Data {
     metering: Arc<super::Metering>,
+    hold_peaks: bool,
     active: Box<Plan>,
     handoff: Arc<Handoff>,
 }
@@ -126,6 +127,7 @@ unsafe extern "C" fn process(data: *mut c_void, position: *mut pw::spa::sys::spa
         let data = &mut *data.cast::<Data>();
         data.activate_pending();
         let metering = data.metering.enabled();
+        let hold_peaks = data.hold_peaks;
         let data = &mut data.active;
         let frames = (*position).clock.duration as usize;
         let rate = (*position).clock.rate.denom as f32;
@@ -191,10 +193,14 @@ unsafe extern "C" fn process(data: *mut c_void, position: *mut pw::spa::sys::spa
         }
         if metering {
             for (id, c) in &data.controls {
-                c.peak.store(
-                    data.processor.peak(*id, frames).to_bits(),
-                    Ordering::Relaxed,
-                );
+                let peak = data.processor.peak(*id, frames).to_bits();
+                if hold_peaks {
+                    // Event sounds can finish between telemetry ticks. Keep
+                    // their highest nonnegative peak until it is consumed.
+                    c.peak.fetch_max(peak, Ordering::Relaxed);
+                } else {
+                    c.peak.store(peak, Ordering::Relaxed);
+                }
                 for (ch, peak) in c.channels.iter().enumerate() {
                     peak.store(
                         data.processor.channel_peak(*id, ch, frames).to_bits(),
@@ -224,6 +230,14 @@ impl Render {
     ) -> Result<Self> {
         Self::new_named(core, scene, &BTreeSet::new(), sample_rate, metering, "alixer.preview")
     }
+    pub fn new_event(
+        core: &pw::core::CoreRc,
+        scene: &Scene,
+        sample_rate: u32,
+        metering: Arc<super::Metering>,
+    ) -> Result<Self> {
+        Self::new_named(core, scene, &BTreeSet::new(), sample_rate, metering, "alixer.system")
+    }
     fn new_named(
         core: &pw::core::CoreRc,
         scene: &Scene,
@@ -232,6 +246,9 @@ impl Render {
         metering: Arc<super::Metering>,
         prefix: &str,
     ) -> Result<Self> {
+        let mut mixer_scene = scene.clone();
+        mixer_scene.strips.retain(|s| s.kind != StripKind::SystemSounds);
+        let scene = &mixer_scene;
         let mut effective = scene.clone();
         for s in &mut effective.strips {
             if suspended.contains(&s.id) {
@@ -301,6 +318,7 @@ impl Render {
         let handoff = Arc::new(Handoff::default());
         let mut data = Box::new(Data {
             metering,
+            hold_peaks: prefix == "alixer.system",
             handoff: handoff.clone(),
             active: Box::new(Plan {
                 processor: Processor::new(effective, MAX_FRAMES)?,
@@ -491,6 +509,9 @@ impl Render {
         suspended: &BTreeSet<Id>,
         sample_rate: u32,
     ) -> Result<Reconfigure> {
+        let mut mixer_scene = scene.clone();
+        mixer_scene.strips.retain(|s| s.kind != StripKind::SystemSounds);
+        let scene = &mixer_scene;
         self.reclaim();
         if self.in_flight {
             // A suspended filter cannot acknowledge a plan. Rebuild on the
@@ -733,6 +754,12 @@ impl Render {
             })
             .collect()
     }
+    pub fn take_peak(&self) -> f32 {
+        // Read held event peaks even if the filter has already gone idle.
+        self.controls.values()
+            .map(|c| f32::from_bits(c.peak.swap(0, Ordering::Relaxed)))
+            .fold(0.0, f32::max)
+    }
     pub fn channel_peaks(&self) -> Vec<(Id, Vec<f32>)> {
         self.controls
             .iter()
@@ -833,6 +860,7 @@ mod tests {
         let handoff = Arc::new(Handoff::default());
         let mut data = Data {
             metering: Arc::new(crate::Metering::default()),
+            hold_peaks: false,
             active: make_plan(&scene, None),
             handoff: handoff.clone(),
         };

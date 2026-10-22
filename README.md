@@ -60,9 +60,28 @@ collected automatically.
 | Restore a collapsed strip | Click **»** at its bottom |
 | Rename a strip | Right-click its name or background → **Rename…** |
 | Reorder strips | Drag a strip's name within its section |
-| Restore default colors | **Changes** → **Reset channel colors** |
+| Restore default colors | **Options** → **Reset channel colors** |
+
+### System sounds
+
+The blue **System sounds** strip sits before the outputs. Its volume and mute
+apply to streams tagged with the event/notification media role or an `event.id`.
+Each sound keeps its requested device; the meter shows the loudest active event.
+These sounds use independent processing paths to their requested devices, outside
+the main mixer's insert graph, and have no routing, aux-send, solo, or effect controls. Untagged
+sounds remain ordinary playback streams. Existing saved event strips are
+consolidated automatically without changing other playback strips.
+
+The WirePlumber integration applies saved controls before a short sound starts.
+After updating a development build, run `alixerctl enable` again and restart
+WirePlumber to refresh its script. Use the matching GUI and daemon binaries.
 
 ### Routing
+
+When a routing change needs a decision, an amber **!** appears on the affected
+channel, including collapsed and offline channels. Click it to compare the
+detected connections with the saved routing and choose which to use. Normal
+stream restarts and clear external moves are handled automatically.
 
 The routing box at the top of each sending strip shows two destination pairs
 per row (`□ □ | □ □`).
@@ -169,12 +188,13 @@ cargo build --workspace
 python3 tests/runtime.py --offline
 python3 tests/runtime.py
 python3 tests/capture.py
+python3 tests/system_sounds.py
 ```
 
 Runtime tests start private PipeWire, WirePlumber, and D-Bus instances with
 temporary config, runtime, and state directories. They do not change desktop audio
 configuration. Live tests require their executables, `pipewire-pulse`, `pactl`,
-`wpctl`, `pw-cli`, `pw-dump`, `pw-play`, `pw-record`, and a C compiler (`cc`)
+`wpctl`, `pw-cli`, `pw-dump`, `pw-play`, `pw-record`, `paplay`, and a C compiler (`cc`)
 for the test-only LV2 fixture. The live test checks uninterrupted playback and
 plugin lifetime while unrelated streams open and close, suspension before and
 after playback, idle CPU use, and microphone preview cleanup after UI disconnects.

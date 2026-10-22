@@ -67,6 +67,7 @@ impl App {
         &mut self,
         ui: &mut egui::Ui,
         strip: &Strip,
+        snapshot: &Snapshot,
         height: f32,
     ) -> egui::Rect {
         let (rect, response) =
@@ -88,8 +89,15 @@ impl App {
             2.0,
             color,
         );
+        let needs_attention = conflict_ui::has_strip_conflict(snapshot, strip.id);
+        if needs_attention {
+            let mut child = ui.new_child(egui::UiBuilder::new()
+                .id_salt(("collapsed-attention", strip.id))
+                .max_rect(egui::Rect::from_min_size(rect.min + Vec2::new(4.0, 22.0), Vec2::new(24.0, 24.0))));
+            self.conflict_badge(&mut child, snapshot, Some(strip.id));
+        }
         let name_rect = egui::Rect::from_min_max(
-            rect.min + Vec2::new(4.0, 24.0),
+            rect.min + Vec2::new(4.0, if needs_attention { 52.0 } else { 24.0 }),
             rect.max - Vec2::new(4.0, 40.0),
         );
         let handle = ui.interact(

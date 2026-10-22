@@ -9,6 +9,7 @@ use alixer_core::{
 use alixer_protocol::*;
 use anyhow::{Context, Result, bail};
 use std::{
+    collections::BTreeSet,
     io::{BufRead, BufReader, Read, Write},
     os::unix::{
         fs::{DirBuilderExt, PermissionsExt},
@@ -159,7 +160,6 @@ fn main() -> Result<()> {
     if let Err(e) = output_names::write(&saved.scene, &output_names::config_path()) {
         eprintln!("Output names: {e:#}");
     }
-    write_guard(&state, &saved)?;
     eprintln!("Alixer listening on {}", socket.display());
     while !STOP.load(Ordering::Relaxed) {
         if let Some(backend) = &backend {
@@ -208,7 +208,6 @@ fn main() -> Result<()> {
                             bindings: reconciled.bindings,
                         };
                         store.save(&saved, None)?;
-                        write_guard(&state, &saved)?;
                         apply_dirty = true;
                     }
                 }
@@ -314,7 +313,6 @@ fn main() -> Result<()> {
                         if matches!(edit, Edit::Rename { .. } | Edit::ResetOutputName { .. }) {
                             output_names::write(&saved.scene, &output_names::config_path())?;
                         }
-                        write_guard(&state, &saved)?;
                         let control = match edit {
                             Edit::Gain { strip, value } => Some((*strip, Some(*value), None)),
                             Edit::Mute { strip, value } => Some((*strip, None, Some(*value))),
@@ -431,7 +429,7 @@ fn active_stream_ids(actual: &Observation, checkpoint: &Checkpoint) -> Vec<Id> {
                 .get(&reconcile::runtime_key(&stream.runtime))
                 .copied()
         })
-        .collect()
+        .collect::<BTreeSet<_>>().into_iter().collect()
 }
 
 fn capture_states(saved: &mut Saved, states: Vec<alixer_audio::PluginState>) {
@@ -533,11 +531,4 @@ fn serve_with_catalog(
         serde_json::to_writer(&mut stream, &reply)?;
         stream.write_all(b"\n")?;
     }
-}
-fn write_guard(dir: &std::path::Path, saved: &Saved) -> Result<()> {
-    let streams:Vec<_>=saved.scene.strips.iter().filter_map(|s|s.identity.as_ref().map(|i|serde_json::json!({"application":i.application,"name":i.name,"target":format!("alixer.input.{}",s.id)}))).collect();
-    let path = dir.join("guard.json.tmp");
-    std::fs::write(&path, serde_json::to_vec(&streams)?)?;
-    std::fs::rename(path, dir.join("guard.json"))?;
-    Ok(())
 }

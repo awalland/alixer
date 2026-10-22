@@ -1,6 +1,6 @@
 use alixer_core::*;
 use serde::{Deserialize, Serialize};
-pub const VERSION: u32 = 6;
+pub const VERSION: u32 = 7;
 pub const MAX_FRAME: usize = 1024 * 1024;
 // Port metadata for a large LV2 installation can exceed the normal IPC limit.
 pub const MAX_CATALOG_FRAME: usize = 32 * 1024 * 1024;

@@ -107,6 +107,13 @@ impl App {
         strip: &Strip,
         snapshot: &Snapshot,
     ) -> egui::Response {
+        if strip.kind == StripKind::SystemSounds {
+            return egui::Frame::new().fill(BG).inner_margin(4.0).corner_radius(3.0).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.set_height(HEIGHT - 8.0);
+                ui.label(RichText::new("Follows each sound’s destination").small().color(DIM));
+            }).response;
+        }
         let frame = egui::Frame::new()
             .fill(BG)
             .inner_margin(4.0)

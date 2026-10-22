@@ -1,4 +1,5 @@
 mod aux_sends;
+mod conflict_ui;
 mod dev_service;
 mod effect_editor;
 mod eq_curve;
@@ -40,12 +41,6 @@ fn output_masters(snapshot: &Snapshot, show_offline: bool) -> impl Iterator<Item
                     .any(|o| Some(&o.key) == s.output_key.as_ref()))
     })
 }
-#[derive(Default, PartialEq)]
-enum Page {
-    #[default]
-    Console,
-    Conflicts,
-}
 enum Event {
     Snapshot(Snapshot),
     Error(String),
@@ -56,7 +51,6 @@ struct App {
     rx: mpsc::Receiver<Event>,
     snapshot: Option<Snapshot>,
     error: String,
-    page: Page,
     selected: Option<Id>,
     new_bus: Option<bool>,
     bus_name: String,
@@ -215,7 +209,6 @@ impl App {
             rx,
             snapshot: None,
             error: String::new(),
-            page: Page::default(),
             selected: None,
             new_bus: None,
             bus_name: String::new(),
@@ -253,6 +246,7 @@ impl App {
     fn console(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
         ui.horizontal(|ui| {
             ui.heading("Mix console");
+            self.conflict_badge(ui, snapshot, None);
             ui.label(
                 RichText::new(format!(
                     "{} inputs · {} streams · {} buses · {} outputs",
@@ -305,7 +299,7 @@ impl App {
         height: f32,
     ) -> egui::Rect {
         if self.preferences.is_hidden(strip.id) {
-            return self.collapsed_strip(ui, strip, height);
+            return self.collapsed_strip(ui, strip, snapshot, height);
         }
         let selected = self.selected == Some(strip.id);
         let output = strip.kind.terminal();
@@ -333,15 +327,24 @@ impl App {
         frame.show(ui,|ui|{
             // A frame inherits the horizontal strip bank's layout.
             ui.with_layout(egui::Layout::top_down(egui::Align::Min),|ui|{
-            ui.set_width(180.0-margins.x);
+            ui.set_width(162.0-margins.x);
             ui.set_height(height-margins.y);
             let background=ui.interact(ui.max_rect(),ui.id().with(("strip-background",strip.id)),egui::Sense::click());
             let color=Color32::from_rgb(strip.color[0],strip.color[1],strip.color[2]);
             let(rect,_)=ui.allocate_exact_size(Vec2::new(ui.available_width(),3.0),egui::Sense::hover());ui.painter().rect_filled(rect,2.0,color);
-            ui.label(RichText::new(match strip.kind{StripKind::Stream=>"PLAYBACK",StripKind::Input=>if online{"MIC / INPUT"}else{"INPUT · OFFLINE"},StripKind::VirtualMic=>"VIRTUAL MIC",StripKind::Group=>"GROUP",StripKind::Aux=>"AUX",StripKind::Output=>if online{"OUTPUT"}else{"OUTPUT · OFFLINE"}}).small().color(DIM));
+            ui.horizontal(|ui| {
+                ui.set_min_height(ui.spacing().interact_size.y);
+                ui.label(RichText::new(match strip.kind{StripKind::Stream=>"PLAYBACK",StripKind::SystemSounds=>"SYSTEM SOUNDS",StripKind::Input=>if online{"MIC / INPUT"}else{"INPUT · OFFLINE"},StripKind::VirtualMic=>"VIRTUAL MIC",StripKind::Group=>"GROUP",StripKind::Aux=>"AUX",StripKind::Output=>if online{"OUTPUT"}else{"OUTPUT · OFFLINE"}}).small().color(DIM));
+                self.conflict_badge(ui, snapshot, Some(strip.id));
+            });
             self.routing_rack(ui,strip,snapshot);
-            self.aux_rack(ui,strip,snapshot);
-            self.plugin_rack(ui,strip,((height-460.0)*0.45).clamp(96.0,360.0));
+            if strip.kind == StripKind::SystemSounds {
+                ui.allocate_space(Vec2::new(ui.available_width(), 64.0));
+                ui.allocate_space(Vec2::new(ui.available_width(), ((height-460.0)*0.45).clamp(96.0,360.0)));
+            } else {
+                self.aux_rack(ui,strip,snapshot);
+                self.plugin_rack(ui,strip,((height-460.0)*0.45).clamp(96.0,360.0));
+            }
             ui.horizontal(|ui|{
                 let mut mute=strip.mute;if ui.add_enabled(online,egui::Button::selectable(mute,RichText::new("M").color(if strip.mute{RED}else{DIM}))).clicked(){mute=!mute;self.edit(Edit::Mute{strip:strip.id,value:mute});}
                 if matches!(strip.kind,StripKind::Stream|StripKind::Input){let mut solo=strip.solo;if ui.toggle_value(&mut solo,RichText::new("S").color(if strip.solo{MINT}else{DIM})).changed(){self.edit(Edit::Solo{strip:strip.id,value:solo});}}
@@ -355,10 +358,11 @@ impl App {
                 let response=ui.add_enabled(online,fader::Fader::new(&mut db,strip.id));
                 if response.changed(){self.edit(Edit::Gain{strip:strip.id,value:if db<=-60.0{0.0}else{10.0_f32.powf(db/20.0)}});}
                 let peaks=if output{snapshot.channel_peaks.iter().find(|(id,_)|*id==strip.id).map(|(_,p)|p.clone()).unwrap_or_else(||vec![0.0;strip.channels.len()])}else{vec![snapshot.peaks.iter().find(|(id,_)|*id==strip.id).map(|(_,p)|*p).unwrap_or_default()]};
-                let width=if output{(peaks.len()as f32*10.0).clamp(15.0,80.0)}else{15.0};
+                let meter_max=(ui.available_width()-32.0-ui.spacing().item_spacing.x).max(15.0);
+                let width=if output{(peaks.len()as f32*10.0).clamp(15.0,80.0).min(meter_max)}else{15.0};
                 let(rect,response)=ui.allocate_exact_size(Vec2::new(width,fader_height),egui::Sense::hover());
                 let levels=peaks.iter().map(|p|if *p<=0.0{"−∞ dBFS".into()}else{format!("{:.1} dBFS",20.0*p.log10())}).collect::<Vec<String>>().join(" / ");
-                response.on_hover_text(if strip.kind==StripKind::Output{format!("{}\n{}\nAfter inserts, before device volume/mute",strip.channels.join(" / "),levels)}else{format!("Post-fader signal\n{levels}")});
+                response.on_hover_text(if strip.kind==StripKind::SystemSounds{format!("Loudest active system sound\n{levels}")}else if strip.kind==StripKind::Output{format!("{}\n{}\nAfter inserts, before device volume/mute",strip.channels.join(" / "),levels)}else{format!("Post-fader signal\n{levels}")});
                 for(ch,peak)in peaks.iter().enumerate(){
                     let mut meter=rect;let step=width/peaks.len().max(1)as f32;meter.min.x+=ch as f32*step;meter.max.x=meter.min.x+(step-1.0).max(0.5);
                     ui.painter().rect_filled(meter,2.0,Color32::from_gray(12));
@@ -375,7 +379,11 @@ impl App {
             let mut db=if strip.gain<=0.0{-60.0}else{20.0*strip.gain.log10()};
             if ui.add_enabled(online,egui::DragValue::new(&mut db).range(-60.0..=12.0).speed(0.1).suffix(" dB")).changed(){self.edit(Edit::Gain{strip:strip.id,value:if db<=-60.0{0.0}else{10.0_f32.powf(db/20.0)}});}
             ui.add(egui::Label::new(RichText::new(strip.channels.join(" / ")).small().color(DIM)).truncate()).on_hover_text(strip.channels.join(" / "));
+            if strip.kind == StripKind::SystemSounds {
+                ui.label(RichText::new("Shared volume · mute").small().color(DIM));
+            } else {
             ui.add(egui::Label::new(RichText::new(format!("{} routes · {} inserts",snapshot.scene.routes.iter().filter(|r|if output{matches!(&r.destination,Destination::Output(key)if Some(key)==strip.output_key.as_ref())}else{r.source==strip.id}).count(),strip.inserts.len())).small().color(DIM)).truncate());
+            }
             let name_top=ui.max_rect().bottom()-STRIP_NAME_HEIGHT;
             ui.add_space((name_top-ui.cursor().top()).max(0.0));
             egui::ScrollArea::vertical().id_salt(("strip-name",strip.id)).max_height(STRIP_NAME_HEIGHT).min_scrolled_height(STRIP_NAME_HEIGHT).auto_shrink([false,false]).show(ui,|ui|{
@@ -448,6 +456,11 @@ impl App {
                 }
             }
         });
+        if strip.kind == StripKind::SystemSounds {
+            ui.separator();
+            ui.label("Shared volume and mute for tagged event sounds. Each sound keeps its requested output.");
+            return;
+        }
         ui.separator();
         ui.label(RichText::new("INSERT EFFECTS").small().color(MINT));
         if self.selected_insert.is_some_and(|(s, _)| s == strip.id)
@@ -586,9 +599,12 @@ impl eframe::App for App {
                     ui.label(RichText::new("ALIXER").size(24.0).strong().color(MINT));
                     ui.label(RichText::new("A LINUX MIXER").small().color(DIM));
                     ui.separator();
-                    for (page, name) in [(Page::Console, "Console"), (Page::Conflicts, "Changes")] {
-                        ui.selectable_value(&mut self.page, page, name);
-                    }
+                    ui.menu_button("Options", |ui| {
+                        if ui.button("Reset channel colors").clicked() {
+                            self.edit(Edit::ResetChannelColors);
+                            ui.close();
+                        }
+                    });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button("+ Aux").clicked() {
                             self.new_bus = Some(true);
@@ -615,11 +631,11 @@ impl eframe::App for App {
                 );
                 if let Some(s) = &snapshot {
                     ui.label(
-                        RichText::new(format!(
-                            "Revision {} · {} unresolved changes",
-                            s.scene.revision,
-                            s.conflicts.len()
-                        ))
+                        RichText::new(if s.conflicts.is_empty() {
+                            format!("Revision {}", s.scene.revision)
+                        } else {
+                            format!("Revision {} · {} need attention", s.scene.revision, s.conflicts.len())
+                        })
                         .small()
                         .color(DIM),
                     );
@@ -674,42 +690,7 @@ impl eframe::App for App {
                         egui::ScrollArea::vertical().show(ui, |ui| self.inspector(ui, snapshot));
                     });
             }
-            egui::CentralPanel::default().show(root, |ui| match self.page {
-                Page::Console => self.console(ui, snapshot),
-                Page::Conflicts => {
-                    if ui.button("Reset channel colors").clicked() {
-                        self.edit(Edit::ResetChannelColors);
-                    }
-                    ui.separator();
-                    ui.heading("Outside changes");
-                    if snapshot.conflicts.is_empty() {
-                        ui.label("No unresolved changes.");
-                    }
-                    for c in &snapshot.conflicts {
-                        ui.group(|ui| {
-                            ui.label(&c.message);
-                            ui.label(
-                                RichText::new("Current audio is preserved until you choose.")
-                                    .color(DIM),
-                            );
-                            ui.horizontal(|ui| {
-                                if ui.button("Keep current").clicked() {
-                                    self.send(Command::Resolve {
-                                        conflict: c.id,
-                                        restore: false,
-                                    });
-                                }
-                                if ui.button("Restore saved").clicked() {
-                                    self.send(Command::Resolve {
-                                        conflict: c.id,
-                                        restore: true,
-                                    });
-                                }
-                            });
-                        });
-                    }
-                }
-            });
+            egui::CentralPanel::default().show(root, |ui| self.console(ui, snapshot));
         } else {
             egui::CentralPanel::default().show(root, |ui| {
                 ui.add_space(100.0);
@@ -803,7 +784,6 @@ fn test_app() -> (App, mpsc::Receiver<Command>) {
         rx,
         snapshot: None,
         error: String::new(),
-        page: Page::Console,
         selected: None,
         new_bus: None,
         bus_name: String::new(),
@@ -972,7 +952,7 @@ mod layout_tests {
                         let first = app.strip(ui, &strip, &snapshot,height);
                         let second = app.strip(ui, &long, &snapshot,height);
                         assert!(
-                            (first.width()-180.0).abs()<0.1&&(second.width()-180.0).abs()<0.1,
+                            (first.width()-162.0).abs()<0.1&&(second.width()-162.0).abs()<0.1,
                             "Strip expanded to {} points",
                             first.width()
                         );

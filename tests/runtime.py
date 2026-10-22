@@ -29,7 +29,7 @@ with tempfile.TemporaryDirectory(prefix="alixer-test-") as tmp:
     def request(command,revision=None):
         with socket.socket(socket.AF_UNIX) as s:
             s.settimeout(5);s.connect(str(root/"run/alixer/control.sock"))
-            s.sendall((json.dumps(dict(version=6,id=1,revision=revision,command=command))+"\n").encode())
+            s.sendall((json.dumps(dict(version=7,id=1,revision=revision,command=command))+"\n").encode())
             return json.loads(s.makefile().readline())
     def snapshot():
         try:return request({"type":"Snapshot"})["result"]["Ok"]["value"]
@@ -245,7 +245,7 @@ with tempfile.TemporaryDirectory(prefix="alixer-test-") as tmp:
                     assert engines()==engine,"color edits must not rebuild DSP"
                     assert any(p[1]>.1 for p in snapshot()["peaks"]),"audio must continue during color edits"
             edit(dict(type="ResetChannelColors"))
-            defaults={"Stream":[91,174,170],"Group":[91,174,170],"Aux":[119,24,151],"Output":[35,24,151]}
+            defaults={"SystemSounds":[100,149,237],"Stream":[91,174,170],"Group":[91,174,170],"Aux":[119,24,151],"Output":[35,24,151]}
             assert all(s["color"]==defaults[s["kind"]] for s in snapshot()["scene"]["strips"])
             time.sleep(.2)
             assert engines()==engine,"resetting colors must not rebuild DSP"

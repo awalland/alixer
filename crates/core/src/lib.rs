@@ -1,6 +1,8 @@
 //! Persistent mixer intent and deterministic reconciliation. No audio or GUI dependencies.
 pub mod effects;
 #[cfg(test)]
+mod system_sound_tests;
+#[cfg(test)]
 mod aux_tests;
 pub mod dsp;
 #[cfg(test)]
@@ -23,9 +25,18 @@ pub struct Identity {
     pub channels: Vec<String>,
 }
 
+/// Explicit stream metadata, never names or playback duration.
+pub fn system_sound_role(role: &str) -> bool {
+    role.eq_ignore_ascii_case("event") || role.eq_ignore_ascii_case("notification")
+}
+impl Identity {
+    pub fn is_system_sound(&self) -> bool { system_sound_role(&self.role) }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StripKind {
     Stream,
+    SystemSounds,
     Input,
     Group,
     Aux,
@@ -73,6 +84,7 @@ impl Strip {
             StripKind::Output | StripKind::VirtualMic => [35, 24, 151],
             StripKind::Aux => [119, 24, 151],
             StripKind::Input => [224, 164, 62],
+            StripKind::SystemSounds => [100, 149, 237],
             _ => [91, 174, 170],
         }
     }
@@ -441,7 +453,7 @@ impl Scene {
                     .retain(|r| !(r.source == source && r.destination == Destination::Bus(aux)));
             }
             Edit::RemoveStrip { strip } => {
-                if self.strip_mut(strip)?.kind.terminal() {
+                if self.strip_mut(strip)?.kind.terminal() || self.strip_mut(strip)?.kind == StripKind::SystemSounds {
                     return Err(ModelError::Invalid);
                 }
                 self.strips.retain(|s| s.id != strip);
@@ -519,8 +531,14 @@ impl Scene {
         if ids.len() != self.strips.len() {
             return Err(ModelError::Invalid);
         }
+        if self.strips.iter().filter(|s| s.kind == StripKind::SystemSounds).count() > 1 {
+            return Err(ModelError::Invalid);
+        }
         let mut endpoints = BTreeSet::new();
         for s in &self.strips {
+            if s.kind == StripKind::SystemSounds && (s.identity.is_some() || s.solo || !s.inserts.is_empty()) {
+                return Err(ModelError::Invalid);
+            }
             if s.output_balance
                 .iter()
                 .any(|v| !v.is_finite() || !(0.0..=1.0).contains(v))
@@ -569,7 +587,7 @@ impl Scene {
                 return Err(ModelError::Invalid);
             }
             let source = self.strip(r.source).ok_or(ModelError::Unknown)?;
-            if source.kind.terminal()
+            if source.kind.terminal() || source.kind == StripKind::SystemSounds
                 || r.source_channel >= source.channels.len()
                 || r.target_channel >= 64
             {
@@ -589,7 +607,7 @@ impl Scene {
     fn require_aux_send(&self, source: Id, aux: Id) -> Result<(), ModelError> {
         let input = self.strip(source).ok_or(ModelError::Unknown)?;
         let target = self.strip(aux).ok_or(ModelError::Unknown)?;
-        if input.kind.terminal() || target.kind != StripKind::Aux {
+        if input.kind.terminal() || input.kind == StripKind::SystemSounds || target.kind != StripKind::Aux {
             return Err(ModelError::Invalid);
         }
         if !self
@@ -638,7 +656,7 @@ pub fn aux_send_channels(
     source: &Strip,
     target: &Strip,
 ) -> Result<Vec<(usize, usize)>, ModelError> {
-    if source.kind.terminal() || target.kind != StripKind::Aux || source.id == target.id {
+    if source.kind.terminal() || source.kind == StripKind::SystemSounds || target.kind != StripKind::Aux || source.id == target.id {
         return Err(ModelError::Invalid);
     }
     if source.channels.len() == 1 && target.channels.len() <= 2 {

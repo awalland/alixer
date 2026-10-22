@@ -1,5 +1,6 @@
 //! Native PipeWire graph observer and controller. All proxies stay on one thread.
 mod render;
+mod system_sounds;
 use alixer_core::{reconcile::runtime_key, *};
 use anyhow::Result;
 use pipewire as pw;
@@ -40,6 +41,7 @@ fn topology_signature(apply: &Apply) -> String {
         .scene
         .strips
         .iter()
+        .filter(|s| s.kind != StripKind::SystemSounds)
         .map(|s| {
             (
                 s.id,
@@ -230,6 +232,9 @@ struct Graph {
     objects: BTreeMap<u32, Raw>,
     epoch: String,
     targets: BTreeMap<u32, String>,
+    system_targets: BTreeMap<u32, String>,
+    system_ready: BTreeMap<u32, String>,
+    saved_targets: Option<String>,
 }
 impl Graph {
     fn expire_activity(&mut self, now: Instant) {
@@ -461,7 +466,8 @@ impl Graph {
                             .or_else(|| node.props.get("node.description"))
                             .cloned()
                             .unwrap_or(name),
-                        role: node.props.get("media.role").cloned().unwrap_or_default(),
+                        role: if system_sounds::is_event(&node.props) { "event".into() }
+                            else { node.props.get("media.role").cloned().unwrap_or_default() },
                         channels: ports.iter().map(|p| p.2.clone()).collect(),
                     },
                     volume: node.volume
@@ -705,7 +711,19 @@ fn run(
                     let listener = m
                         .add_listener_local()
                         .property(move |subject, key, _, value| {
-                            if key == Some("target.object") {
+                            if key == Some("alixer.system-sounds.ready") {
+                                let mut graph = graph.borrow_mut();
+                                graph.dirty = true;
+                                if let Some(value) = value { graph.system_ready.insert(subject, value.into()); }
+                                else { graph.system_ready.remove(&subject); }
+                            } else if key == Some("alixer.system-sounds.target") {
+                                let mut graph = graph.borrow_mut();
+                                graph.dirty = true;
+                                if let Some(value) = value { graph.system_targets.insert(subject, value.into()); }
+                                else { graph.system_targets.remove(&subject); }
+                            } else if subject == 0 && key == Some("alixer.saved-targets") {
+                                graph.borrow_mut().saved_targets = value.map(str::to_owned);
+                            } else if key == Some("target.object") {
                                 graph.borrow_mut().dirty = true;
                                 if let Some(value) = value {
                                     graph.borrow_mut().targets.insert(subject, value.into());
@@ -726,7 +744,15 @@ fn run(
             let keep = proxies.clone();
             move |id| {
                 g.borrow_mut().dirty = true;
-                g.borrow_mut().objects.remove(&id);
+                let removed = g.borrow_mut().objects.remove(&id);
+                g.borrow_mut().system_targets.remove(&id);
+                g.borrow_mut().system_ready.remove(&id);
+                g.borrow_mut().targets.remove(&id);
+                if removed.is_some_and(|raw| raw.kind == "Metadata" && raw.props.get("metadata.name").map(String::as_str) == Some("default")) {
+                    g.borrow_mut().saved_targets = None;
+                    g.borrow_mut().system_targets.clear();
+                    g.borrow_mut().system_ready.clear();
+                }
                 keep.borrow_mut().remove(&id);
             }
         })
@@ -736,6 +762,7 @@ fn run(
         desired: Option<Apply>,
         render: Option<render::Render>,
         previews: BTreeMap<Id, Preview>,
+        sounds: system_sounds::Sounds,
         signature: String,
         links: BTreeMap<(u32, u32), pw::link::Link>,
         ingresses: BTreeMap<String, pw::node::Node>,
@@ -747,6 +774,7 @@ fn run(
         desired: None,
         render: None,
         previews: BTreeMap::new(),
+        sounds: system_sounds::Sounds::default(),
         signature: String::new(),
         links: BTreeMap::new(),
         ingresses: BTreeMap::new(),
@@ -784,7 +812,7 @@ fn run(
         };
         let mut command_changed = false;
         let mut state=controller.borrow_mut();
-        let Controller{desired,render,previews,signature,links,ingresses,render_error,states,rate}=&mut *state;
+        let Controller{desired,render,previews,sounds,signature,links,ingresses,render_error,states,rate}=&mut *state;
         if let Some(current)=render.as_mut(){current.reclaim();let observed=current.rate();if observed>0&&observed!=*rate{*rate=observed;signature.clear();*topology_pending=true;}}
         while let Ok(mut command)=rx.try_recv(){
             command_changed = true;
@@ -799,13 +827,23 @@ fn run(
         metering.refresh_polling(last_meter_request, Instant::now());
         let metering_enabled = metering.enabled();
         let has_consumers = metering_enabled;
-        let preview_rate_changed = previews.values().any(|p| p.render.rate() != p.rate);
+        let preview_rate_changed = sounds.rate_changed() || previews.values().any(|p| p.render.rate() != p.rate);
         let latency_overflow = render.as_ref().is_some_and(|r| r.latency_overflow());
         let needs_work = preview_rate_changed || latency_overflow != *previous_overflow || has_consumers != *had_consumers || graph_changed || command_changed || *topology_pending || !render_error.is_empty();
         if !needs_work && !metering_enabled { return; }
         *had_consumers = has_consumers;
         *previous_overflow = latency_overflow;
         if needs_work { if let Some(apply)=desired.as_ref() {
+            if let Some(metadata) = metadata.borrow().as_ref() {
+                let targets: Vec<_> = apply.scene.strips.iter().filter(|s| s.kind == StripKind::Stream)
+                    .filter_map(|s| s.identity.as_ref().map(|i| serde_json::json!({
+                        "application": i.application, "name": i.name, "target": format!("alixer.input.{}", s.id)
+                    }))).collect();
+                let targets = serde_json::to_string(&targets).expect("saved stream targets are serializable");
+                if graph.borrow().saved_targets.as_ref() != Some(&targets) {
+                    metadata.set_property(0, "alixer.saved-targets", Some("Spa:String:JSON"), Some(&targets));
+                }
+            }
             let live_strips: BTreeSet<_> = graph.borrow().observation().streams.iter()
                 .filter_map(|stream| apply.bindings.get(&runtime_key(&stream.runtime)).copied())
                 .collect();
@@ -888,7 +926,7 @@ fn run(
                     let name=format!("alixer.input.{}",strip.id);
                     let ingress=g.objects.iter().find(|(_,o)|o.kind=="Node"&&o.props.get("node.name")==Some(&name)).map(|(id,_)|*id);
                     if ingress.is_none()&&pending_ingresses.borrow_mut().insert(name.clone()) {
-                        let props=properties!{"factory.name"=>"support.null-audio-sink","node.name"=>name.clone(),"node.description"=>format!("Alixer · {}",strip.name),"media.class"=>"Audio/Sink","audio.channels"=>strip.channels.len().to_string(),"audio.position"=>format!("[ {} ]",strip.channels.join(" ")),"object.linger"=>"true","node.virtual"=>"true","priority.session"=>"-1000","alixer.strip"=>strip.id.to_string(),"monitor.channel-volumes"=>"false"};
+                        let props=properties!{"factory.name"=>"support.null-audio-sink","node.name"=>name.clone(),"node.description"=>format!("Alixer · {}",strip.name),"media.class"=>"Audio/Sink","node.driver"=>"false","audio.channels"=>strip.channels.len().to_string(),"audio.position"=>format!("[ {} ]",strip.channels.join(" ")),"object.linger"=>"true","node.virtual"=>"true","priority.session"=>"-1000","alixer.strip"=>strip.id.to_string(),"monitor.channel-volumes"=>"false"};
                         match core.create_object::<pw::node::Node>("adapter",&props){Ok(node)=>{ingresses.insert(name.clone(),node);},Err(e)=>{*render_error=e.to_string();pending_ingresses.borrow_mut().remove(&name);}}
                     }
                     let Some(ingress)=ingress else{continue};
@@ -930,6 +968,9 @@ fn run(
                 if let Err(e) = sync_previews(&core, &g, apply, &metering, previews, links, &mut linked) {
                     *render_error = format!("Input preview: {e:#}");
                 }
+                if let Err(e) = sounds.sync(&core, &g, &apply.scene, &metering, metadata.borrow().as_ref(), links, &mut linked) {
+                    *render_error = format!("System sounds: {e:#}");
+                }
                 links.retain(|ports, _| linked.contains(ports));
             }
         }
@@ -942,6 +983,10 @@ fn run(
         let mut plugin_meters=render.as_ref().map(|r|r.plugin_meters()).unwrap_or_default();
         peaks.retain(|(id, _)| !previews.contains_key(id));
         channel_peaks.retain(|(id, _)| !previews.contains_key(id));
+        if let Some(system) = desired.as_ref().and_then(|a| a.scene.strips.iter().find(|s| s.kind == StripKind::SystemSounds)) {
+            peaks.retain(|(id, _)| *id != system.id);
+            peaks.push((system.id, sounds.peak()));
+        }
         for preview in previews.values() {
             peaks.extend(preview.render.peaks());
             channel_peaks.extend(preview.render.channel_peaks());
@@ -1267,6 +1312,15 @@ fn wire(
     let (Some(sp), Some(tp)) = (port(sn, true, source_port), port(tn, false, target_port)) else {
         return;
     };
+    wire_ports(core, linked, links, sp, tp);
+}
+fn wire_ports(
+    core: &pw::core::CoreRc,
+    linked: &mut BTreeSet<(u32, u32)>,
+    links: &mut BTreeMap<(u32, u32), pw::link::Link>,
+    sp: u32,
+    tp: u32,
+) {
     linked.insert((sp, tp));
     if links.contains_key(&(sp, tp)) {
         return;

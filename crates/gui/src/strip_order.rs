@@ -5,16 +5,41 @@ struct StripDrag(Id);
 
 fn section(kind: &StripKind) -> u8 {
     match kind {
-        StripKind::Input => 0,
-        StripKind::Stream => 1,
+        StripKind::Stream => 0,
+        StripKind::Input => 1,
         StripKind::Group | StripKind::Aux => 2,
-        StripKind::Output | StripKind::VirtualMic => 3,
+        StripKind::SystemSounds => 3,
+        StripKind::Output | StripKind::VirtualMic => 4,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn system_sounds_sits_before_outputs_with_no_routing_or_insert_controls() {
+        let h = Harness::new(vec![StripKind::Output, StripKind::SystemSounds, StripKind::Group,
+            StripKind::Stream, StripKind::Input], false);
+        assert!(h.labels["Channel 3"].x < h.labels["Channel 4"].x);
+        assert!(h.labels["Channel 4"].x < h.labels["Channel 2"].x);
+        assert!(h.labels["Channel 2"].x < h.labels["Channel 1"].x);
+        assert!(h.labels["Channel 1"].x < h.labels["Channel 0"].x);
+        assert_eq!(h.snapshot.scene.strips[1].color, [100, 149, 237]);
+        assert!(h.commands.try_recv().is_err());
+        let (mut app, commands) = test_app();
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            app.strip(ui, &h.snapshot.scene.strips[1], &h.snapshot, STRIP_MIN_HEIGHT);
+        });
+        let text: Vec<_> = output.shapes.iter().filter_map(|s| match &s.shape {
+            egui::epaint::Shape::Text(t) => Some(t.galley.text()), _ => None,
+        }).collect();
+        assert!(text.contains(&"Follows each sound’s destination"));
+        assert!(!text.iter().any(|t| t.contains("Right-click to add") || t.contains("AUX SENDS")));
+        assert!(commands.try_recv().is_err());
+        output.textures_delta.clear();
+    }
 
     #[test]
     fn moves_preserve_other_sections_and_include_offline_strips() {
@@ -325,7 +350,7 @@ impl App {
         let mut rects = vec![];
         ui.horizontal_top(|ui| {
             let mut previous = None;
-            for bank in 0..4 {
+            for bank in 0..5 {
                 for strip in snapshot
                     .scene
                     .strips
@@ -346,7 +371,7 @@ impl App {
                             .any(|o| Some(&o.key) == strip.output_key.as_ref()),
                         _ => true,
                     };
-                    if !online && !self.show_inactive {
+                    if !online && !self.show_inactive && !conflict_ui::has_strip_conflict(snapshot, strip.id) {
                         continue;
                     }
                     if previous.is_some_and(|previous| previous != bank) {

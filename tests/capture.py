@@ -56,7 +56,7 @@ with tempfile.TemporaryDirectory(prefix="alixer-capture-") as tmp:
         with socket.socket(socket.AF_UNIX) as connection:
             connection.settimeout(5)
             connection.connect(str(root / "run/alixer/control.sock"))
-            connection.sendall((json.dumps(dict(version=6, id=1, revision=revision, command=command_value)) + "\n").encode())
+            connection.sendall((json.dumps(dict(version=7, id=1, revision=revision, command=command_value)) + "\n").encode())
             return json.loads(connection.makefile().readline())["result"]
 
     def snapshot():
@@ -145,7 +145,7 @@ with tempfile.TemporaryDirectory(prefix="alixer-capture-") as tmp:
         with socket.socket(socket.AF_UNIX) as ui:
             ui.settimeout(5)
             ui.connect(str(root / "run/alixer/control.sock"))
-            ui.sendall((json.dumps(dict(version=6, id=1, revision=None,
+            ui.sendall((json.dumps(dict(version=7, id=1, revision=None,
                                        command=dict(type="Subscribe"))) + "\n").encode())
             with ui.makefile() as frames:
                 def input_meter():

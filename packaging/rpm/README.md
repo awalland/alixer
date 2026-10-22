@@ -33,7 +33,7 @@ The RPM requires the LSP LV2 effects package (`lv2-lsp-plugins` on openSUSE,
 Install the matching binary RPM with zypper (replace the filename as needed):
 
 ```sh
-sudo zypper install ./target/rpm/RPMS/x86_64/alixer-0.2.5-1.x86_64.rpm
+sudo zypper install ./target/rpm/RPMS/x86_64/alixer-0.2.6-1.x86_64.rpm
 alixerctl enable
 systemctl --user daemon-reload
 systemctl --user restart wireplumber.service
@@ -46,8 +46,9 @@ start the mixer or globally activate its WirePlumber hook. Each user opts in
 with alixerctl enable. It creates only the user's activation fragment, using
 the RPM-owned service and Lua script. Generated development copies are removed
 when switching to the RPM; custom overrides are preserved and reported.
-The fragment enables an optional component, so it will not prevent WirePlumber
-from starting if the package is later removed while that user fragment remains.
+The fragment enables a small virtual component that requests the script as an
+optional dependency. The script is loaded when installed, and WirePlumber can
+still start if the package is later removed while that user fragment remains.
 
 To stop using the integration:
 
