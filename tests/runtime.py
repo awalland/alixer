@@ -140,6 +140,27 @@ with tempfile.TemporaryDirectory(prefix="alixer-test-") as tmp:
             wait(lambda:next(o["volume"] for o in snapshot()["observation"]["outputs"] if o["key"]=="test.speakers")==0,"master reaches zero")
             edit(dict(type="Gain",strip=speaker_id,value=.216))
             wait(lambda:(volumes:=next(o["channel_volumes"] for o in snapshot()["observation"]["outputs"] if o["key"]=="test.speakers")) and abs(volumes[0]-.216)<.005 and abs(volumes[1]-.108)<.005,"channel balance survives zero master gain")
+            def engine_info():
+                return [o["info"] for o in json.loads(command(["pw-dump"]))
+                        if o.get("info",{}).get("props",{}).get("node.name", "").startswith("alixer.engine.")]
+            def engine_idle():
+                engines = engine_info()
+                return engines and all(e["state"] in ("idle", "suspended") for e in engines)
+            wait(engine_idle, "unused mixer suspends with output links attached")
+            # Successive edits must not wait forever for an idle audio callback.
+            for name in ("Idle bus A", "Idle bus B", "Idle bus C"):
+                edit(dict(type="AddBus", name=name, aux=False, channels=["FL", "FR"]))
+                time.sleep(.3)
+            wait(engine_idle, "mixer remains idle after successive graph edits")
+            def cpu_ticks():
+                fields = pathlib.Path(f"/proc/{daemon.pid}/stat").read_text().split()
+                return int(fields[13]) + int(fields[14])
+            time.sleep(.5)
+            ticks, started_idle = cpu_ticks(), time.monotonic()
+            time.sleep(2)
+            idle_cpu = 100 * (cpu_ticks() - ticks) / os.sysconf("SC_CLK_TCK") / (time.monotonic() - started_idle)
+            assert idle_cpu < 2, f"idle daemon consumed {idle_cpu:.2f}% CPU"
+            print(f"Idle daemon CPU (debug build, private PipeWire): {idle_cpu:.2f}%")
             path=root/"tone.wav"
             with wave.open(str(path),"wb") as wav:
                 wav.setparams((2,2,48000,0,"NONE","not compressed"))
@@ -308,6 +329,8 @@ wireplumber.profiles = { main = { custom.alixer-output-name-test = required } }
                 time.sleep(1)
                 assert wp.poll() is None,"leftover optional activation must not break WirePlumber"
                 command(["wpctl","status"])
+            player.terminate(); player.wait(timeout=5)
+            wait(engine_idle, "mixer suspends after playback ends, including saved LV2 strips")
             print("PASS: native discovery/DSP, uninterrupted stream changes/LV2 reuse, exact active strips, legacy Lixer ingress handover, live aux controls, retained/deleted masters, device controls, downtime/hotplug reconciliation, and global output names/reset through WirePlumber and PulseAudio")
     except Exception:
         for i,log in enumerate(logs):

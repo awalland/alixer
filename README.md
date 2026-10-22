@@ -36,6 +36,11 @@ the GUI connects to the independently running service.
 | Audio service | `alixerd` / `alixer.service` |
 | Command-line client | `alixerctl` |
 
+The service keeps audio running when the GUI closes. Its PipeWire graph sleeps
+when no playback or connected, routed microphone inputs need processing. Metering
+runs for GUI subscribers and explicit snapshot requests; unrouted microphone
+preview connections are released when metering stops.
+
 ## Using the console
 
 ### Faders and layout
@@ -162,7 +167,8 @@ temporary config, runtime, and state directories. They do not change desktop aud
 configuration. Live tests require their executables, `pipewire-pulse`, `pactl`,
 `wpctl`, `pw-cli`, `pw-dump`, `pw-play`, `pw-record`, and a C compiler (`cc`)
 for the test-only LV2 fixture. The live test checks uninterrupted playback and
-plugin lifetime while unrelated streams open and close.
+plugin lifetime while unrelated streams open and close, suspension before and
+after playback, idle CPU use, and microphone preview cleanup after UI disconnects.
 
 ### Native LV2 tests
 

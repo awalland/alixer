@@ -9,7 +9,6 @@ use alixer_core::{
 use alixer_protocol::*;
 use anyhow::{Context, Result, bail};
 use std::{
-    collections::BTreeSet,
     io::{BufRead, BufReader, Read, Write},
     os::unix::{
         fs::{DirBuilderExt, PermissionsExt},
@@ -20,12 +19,39 @@ use std::{
         atomic::{AtomicBool, Ordering},
         mpsc,
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 use store::{Saved, Store};
 static STOP: AtomicBool = AtomicBool::new(false);
 extern "C" fn stop(_: libc::c_int) {
     STOP.store(true, Ordering::Relaxed);
+}
+struct Published {
+    snapshot: Mutex<Snapshot>,
+    metering: Arc<alixer_audio::Metering>,
+}
+impl Published {
+    fn new(snapshot: Snapshot) -> Self {
+        Self {
+            snapshot: Mutex::new(snapshot),
+            metering: Arc::default(),
+        }
+    }
+    fn lock(&self) -> std::sync::LockResult<std::sync::MutexGuard<'_, Snapshot>> {
+        self.snapshot.lock()
+    }
+}
+struct Subscription(Arc<alixer_audio::Metering>);
+impl Subscription {
+    fn new(metering: Arc<alixer_audio::Metering>) -> Self {
+        metering.subscribers.fetch_add(1, Ordering::Relaxed);
+        Self(metering)
+    }
+}
+impl Drop for Subscription {
+    fn drop(&mut self) {
+        self.0.subscribers.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 struct Incoming {
     request: Request,
@@ -84,7 +110,7 @@ fn main() -> Result<()> {
         channel_peaks: vec![],
         plugin_meters: vec![],
     };
-    let public = Arc::new(Mutex::new(initial));
+    let public = Arc::new(Published::new(initial));
     let published = public.clone();
     std::thread::spawn(move || {
         for connection in listener.incoming() {
@@ -112,18 +138,19 @@ fn main() -> Result<()> {
     let mut backend = if offline {
         None
     } else {
-        Some(alixer_audio::Backend::start())
+        Some(alixer_audio::Backend::start(public.metering.clone()))
     };
     let mut actual = Observation::default();
+    let mut observation_seen = false;
     let mut status = if offline {
         "Offline mode".to_string()
     } else {
         "Connecting to PipeWire".to_string()
     };
     let mut peaks = vec![];
-    let mut last_observation = String::new();
-    let mut last_apply = String::new();
-    let mut last_publish = Instant::now();
+    let mut apply_dirty = true;
+    let mut publish_dirty = true;
+    let mut pending = None;
     let mut channel_peaks = vec![];
     let mut plugin_meters = vec![];
     let mut output_controls = vec![];
@@ -147,8 +174,11 @@ fn main() -> Result<()> {
             }
             if state_changed {
                 store.save(&saved, None)?;
+                apply_dirty = true;
+                publish_dirty = true;
             }
             if let Some(update) = latest {
+                publish_dirty = true;
                 if !update.states.is_empty() {
                     capture_states(&mut saved, update.states);
                     store.save(&saved, None)?;
@@ -158,13 +188,13 @@ fn main() -> Result<()> {
                 channel_peaks = update.channel_peaks;
                 plugin_meters = update.plugin_meters;
                 if status.starts_with("Disconnected") {
-                    last_apply.clear();
+                    apply_dirty = true;
                 }
                 // A disconnect is not a new baseline and cannot erase a usable observation.
                 if status.starts_with("Connected") || status.starts_with("Audio error") {
-                    actual = update.observation;
-                    let signature = serde_json::to_string(&actual)?;
-                    if signature != last_observation {
+                    if !observation_seen || actual != update.observation {
+                        observation_seen = true;
+                        actual = update.observation;
                         let reconciled = reconcile::reconcile(
                             &saved.scene,
                             &saved.checkpoint,
@@ -179,12 +209,12 @@ fn main() -> Result<()> {
                         };
                         store.save(&saved, None)?;
                         write_guard(&state, &saved)?;
-                        last_observation = signature;
+                        apply_dirty = true;
                     }
                 }
             }
         }
-        while let Ok(incoming) = rx.try_recv() {
+        while let Some(incoming) = pending.take().or_else(|| rx.try_recv().ok()) {
             let request = incoming.request;
             let result: Result<Payload> = (|| {
                 if request.version != VERSION {
@@ -336,6 +366,12 @@ fn main() -> Result<()> {
                     }
                 }
             })();
+            if result.is_ok()
+                && matches!(request.command, Command::Edit(_) | Command::Resolve { .. })
+            {
+                apply_dirty = true;
+                publish_dirty = true;
+            }
             let reply = Reply {
                 version: VERSION,
                 id: request.id,
@@ -344,15 +380,9 @@ fn main() -> Result<()> {
             };
             let _ = incoming.reply.send(reply);
         }
-        if let Some(backend) = &backend {
-            let suspended: BTreeSet<_> = saved.conflicts.iter().filter_map(|c| c.strip).collect();
-            let key = format!(
-                "{}:{:?}:{:?}",
-                serde_json::to_string(&saved.scene)?,
-                saved.checkpoint.bindings,
-                suspended
-            );
-            if key != last_apply || !output_controls.is_empty() {
+        if apply_dirty {
+            if let Some(backend) = &backend {
+                let suspended = saved.conflicts.iter().filter_map(|c| c.strip).collect();
                 backend.commands.send(alixer_audio::Apply {
                     scene: saved.scene.clone(),
                     bindings: saved.checkpoint.bindings.clone(),
@@ -360,10 +390,10 @@ fn main() -> Result<()> {
                     state_dir: state.clone(),
                     output_controls: std::mem::take(&mut output_controls),
                 })?;
-                last_apply = key;
             }
+            apply_dirty = false;
         }
-        if last_publish.elapsed() >= Duration::from_millis(33) {
+        if publish_dirty {
             *public
                 .lock()
                 .map_err(|_| anyhow::anyhow!("Snapshot lock poisoned"))? = Snapshot {
@@ -376,9 +406,11 @@ fn main() -> Result<()> {
                 channel_peaks: channel_peaks.clone(),
                 plugin_meters: plugin_meters.clone(),
             };
-            last_publish = Instant::now();
+            publish_dirty = false;
         }
-        std::thread::sleep(Duration::from_millis(10));
+        // IPC wakes us immediately; audio observations arrive at 10 Hz. Avoid
+        // serializing and copying an unchanged scene on a 100 Hz polling loop.
+        pending = rx.recv_timeout(Duration::from_millis(100)).ok();
     }
     if let Some(backend) = &mut backend {
         capture_states(&mut saved, backend.shutdown());
@@ -390,9 +422,16 @@ fn main() -> Result<()> {
     Ok(())
 }
 fn active_stream_ids(actual: &Observation, checkpoint: &Checkpoint) -> Vec<Id> {
-    actual.streams.iter().filter_map(|stream| {
-        checkpoint.bindings.get(&reconcile::runtime_key(&stream.runtime)).copied()
-    }).collect()
+    actual
+        .streams
+        .iter()
+        .filter_map(|stream| {
+            checkpoint
+                .bindings
+                .get(&reconcile::runtime_key(&stream.runtime))
+                .copied()
+        })
+        .collect()
 }
 
 fn capture_states(saved: &mut Saved, states: Vec<alixer_audio::PluginState>) {
@@ -404,11 +443,7 @@ fn capture_states(saved: &mut Saved, states: Vec<alixer_audio::PluginState>) {
         }
     }
 }
-fn serve(
-    stream: UnixStream,
-    tx: mpsc::SyncSender<Incoming>,
-    public: Arc<Mutex<Snapshot>>,
-) -> Result<()> {
+fn serve(stream: UnixStream, tx: mpsc::SyncSender<Incoming>, public: Arc<Published>) -> Result<()> {
     serve_with_catalog(stream, tx, public, || {
         Ok(serde_json::to_value(alixer_lv2::catalog()?)?)
     })
@@ -416,7 +451,7 @@ fn serve(
 fn serve_with_catalog(
     mut stream: UnixStream,
     tx: mpsc::SyncSender<Incoming>,
-    public: Arc<Mutex<Snapshot>>,
+    public: Arc<Published>,
     catalog: impl Fn() -> Result<serde_json::Value>,
 ) -> Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
@@ -469,6 +504,7 @@ fn serve_with_catalog(
             if request.version != VERSION {
                 bail!("Unsupported protocol version");
             }
+            let _subscription = Subscription::new(public.metering.clone());
             loop {
                 let snapshot = public
                     .lock()
@@ -484,6 +520,9 @@ fn serve_with_catalog(
                 stream.write_all(b"\n")?;
                 std::thread::sleep(Duration::from_millis(33));
             }
+        }
+        if matches!(request.command, Command::Snapshot) {
+            public.metering.request();
         }
         let (reply_tx, reply_rx) = mpsc::channel();
         tx.send(Incoming {

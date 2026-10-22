@@ -58,6 +58,7 @@ impl Drop for Handoff {
 }
 
 struct Data {
+    metering: Arc<super::Metering>,
     active: Box<Plan>,
     handoff: Arc<Handoff>,
 }
@@ -124,6 +125,7 @@ unsafe extern "C" fn process(data: *mut c_void, position: *mut pw::spa::sys::spa
     unsafe {
         let data = &mut *data.cast::<Data>();
         data.activate_pending();
+        let metering = data.metering.enabled();
         let data = &mut data.active;
         let frames = (*position).clock.duration as usize;
         let rate = (*position).clock.rate.denom as f32;
@@ -137,7 +139,7 @@ unsafe extern "C" fn process(data: *mut c_void, position: *mut pw::spa::sys::spa
             }
             return;
         }
-        data.processor.clear();
+        data.processor.clear_frames(frames);
         for (id, ch, port) in &data.inputs {
             let input = pw::sys::pw_filter_get_dsp_buffer(*port, frames as u32).cast::<f32>();
             if !input.is_null() {
@@ -187,16 +189,18 @@ unsafe extern "C" fn process(data: *mut c_void, position: *mut pw::spa::sys::spa
                     .output(name, *ch, std::slice::from_raw_parts_mut(output, frames));
             }
         }
-        for (id, c) in &data.controls {
-            c.peak.store(
-                data.processor.peak(*id, frames).to_bits(),
-                Ordering::Relaxed,
-            );
-            for (ch, peak) in c.channels.iter().enumerate() {
-                peak.store(
-                    data.processor.channel_peak(*id, ch, frames).to_bits(),
+        if metering {
+            for (id, c) in &data.controls {
+                c.peak.store(
+                    data.processor.peak(*id, frames).to_bits(),
                     Ordering::Relaxed,
                 );
+                for (ch, peak) in c.channels.iter().enumerate() {
+                    peak.store(
+                        data.processor.channel_peak(*id, ch, frames).to_bits(),
+                        Ordering::Relaxed,
+                    );
+                }
             }
         }
     }
@@ -207,6 +211,7 @@ impl Render {
         scene: &Scene,
         suspended: &BTreeSet<Id>,
         sample_rate: u32,
+        metering: Arc<super::Metering>,
     ) -> Result<Self> {
         let mut effective = scene.clone();
         for s in &mut effective.strips {
@@ -276,6 +281,7 @@ impl Render {
         let overflow = Arc::new(AtomicBool::new(false));
         let handoff = Arc::new(Handoff::default());
         let mut data = Box::new(Data {
+            metering,
             handoff: handoff.clone(),
             active: Box::new(Plan {
                 processor: Processor::new(effective, MAX_FRAMES)?,
@@ -299,7 +305,7 @@ impl Render {
         events.process = Some(process);
         let mut hook = Box::new(unsafe { std::mem::zeroed() });
         let name = format!("alixer.engine.{}", Id::new_v4());
-        let props = properties! {"node.name"=>name.clone(),"node.description"=>"Alixer mixer","media.class"=>"Audio/Filter","node.autoconnect"=>"false","node.link-group"=>"alixer","node.always-process"=>"true","audio.rate"=>"48000"};
+        let props = properties! {"node.name"=>name.clone(),"node.description"=>"Alixer mixer","media.class"=>"Audio/Filter","node.autoconnect"=>"false","node.link-group"=>"alixer","audio.rate"=>"48000"};
         let filter = unsafe {
             pw::sys::pw_filter_new(core.as_raw_ptr(), c"Alixer".as_ptr(), props.into_raw())
         };
@@ -343,7 +349,15 @@ impl Render {
         }) {
             for ch in 0..strip.channels.len() {
                 let name = format!("in_{}_{}", strip.id.simple(), ch);
-                let port = this.port(&name, false)?;
+                let port = this.port(
+                    &name,
+                    false,
+                    if strip.kind == StripKind::Stream {
+                        "follow"
+                    } else {
+                        "false"
+                    },
+                )?;
                 this._data.active.inputs.push((strip.id, ch, port));
                 this.input_ports.insert((strip.id, ch), port);
                 this.input_names.insert((strip.id, ch), name);
@@ -369,7 +383,7 @@ impl Render {
         }
         for (output, ch) in outputs {
             let name = format!("out_{}", this.outputs.len());
-            let port = this.port(&name, true)?;
+            let port = this.port(&name, true, "true")?;
             this._data.active.outputs.push((output.clone(), ch, port));
             this.output_ports
                 .insert((output.clone(), ch), (port, name.clone()));
@@ -392,8 +406,10 @@ impl Render {
         }
         Ok(this)
     }
-    fn port(&self, name: &str, output: bool) -> Result<*mut c_void> {
-        let props = properties! {"format.dsp"=>"32 bit float mono audio","port.name"=>name,"port.physical"=>"false"};
+    // Playback inputs follow their ingress; outputs must not wake idle sinks.
+    // Hardware input ports actively drive the graph only while wired by the controller.
+    fn port(&self, name: &str, output: bool, passive: &str) -> Result<*mut c_void> {
+        let props = properties! {"format.dsp"=>"32 bit float mono audio","port.name"=>name,"port.physical"=>"false","port.passive"=>passive};
         let port = unsafe {
             pw::sys::pw_filter_add_port(
                 self.filter,
@@ -458,7 +474,13 @@ impl Render {
     ) -> Result<Reconfigure> {
         self.reclaim();
         if self.in_flight {
-            return Ok(Reconfigure::Busy);
+            // A suspended filter cannot acknowledge a plan. Rebuild on the
+            // control thread so subsequent edits can introduce new wakeup links.
+            return Ok(if self.running() {
+                Reconfigure::Busy
+            } else {
+                Reconfigure::Rebuild
+            });
         }
         // Preserve running plugin instances for normal graph edits. A sample-rate
         // change or insert-chain edit still uses the checkpoint/rebuild fallback.
@@ -531,7 +553,15 @@ impl Render {
                 let port = if let Some(port) = self.input_ports.get(&key) {
                     *port
                 } else {
-                    let port = self.port(&name, false)?;
+                    let port = self.port(
+                        &name,
+                        false,
+                        if s.kind == StripKind::Stream {
+                            "follow"
+                        } else {
+                            "false"
+                        },
+                    )?;
                     self.input_ports.insert(key, port);
                     port
                 };
@@ -565,7 +595,7 @@ impl Render {
             } else {
                 let name = format!("out_{}", self.next_output);
                 self.next_output += 1;
-                let port = self.port(&name, true)?;
+                let port = self.port(&name, true, "true")?;
                 self.output_ports
                     .insert((key.clone(), ch), (port, name.clone()));
                 (port, name)
@@ -662,10 +692,26 @@ impl Render {
             })
             .collect()
     }
+    fn running(&self) -> bool {
+        !self.filter.is_null()
+            && unsafe {
+                pw::sys::pw_filter_get_state(self.filter, ptr::null_mut())
+                    == pw::sys::pw_filter_state_PW_FILTER_STATE_STREAMING
+            }
+    }
     pub fn peaks(&self) -> Vec<(Id, f32)> {
         self.controls
             .iter()
-            .map(|(id, c)| (*id, f32::from_bits(c.peak.load(Ordering::Relaxed))))
+            .map(|(id, c)| {
+                (
+                    *id,
+                    if self.running() {
+                        f32::from_bits(c.peak.load(Ordering::Relaxed))
+                    } else {
+                        0.0
+                    },
+                )
+            })
             .collect()
     }
     pub fn channel_peaks(&self) -> Vec<(Id, Vec<f32>)> {
@@ -676,7 +722,13 @@ impl Render {
                     *id,
                     c.channels
                         .iter()
-                        .map(|p| f32::from_bits(p.load(Ordering::Relaxed)))
+                        .map(|p| {
+                            if self.running() {
+                                f32::from_bits(p.load(Ordering::Relaxed))
+                            } else {
+                                0.0
+                            }
+                        })
                         .collect(),
                 )
             })
@@ -761,6 +813,7 @@ mod tests {
             .push(Strip::new("Music", StripKind::Stream, vec!["MONO".into()]));
         let handoff = Arc::new(Handoff::default());
         let mut data = Data {
+            metering: Arc::new(crate::Metering::default()),
             active: make_plan(&scene, None),
             handoff: handoff.clone(),
         };
