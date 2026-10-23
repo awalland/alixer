@@ -5,6 +5,11 @@ local cutils = require ("common-utils")
 -- Client lifetime remains stable across DSP rebuilds and ends on both a
 -- graceful stop and a crash. Never hold desktop playback after it disappears.
 local engines = {}
+-- A WirePlumber restart can discover an already running engine before this
+-- script registers its client-added hook.
+for client in cutils.get_object_manager("client"):iterate() do
+  if client.properties["application.id"] == "org.alixer.Engine" then engines[client.id] = true end
+end
 local function engine_running()
   return next(engines) ~= nil
 end
@@ -92,7 +97,7 @@ SimpleEventHook {
 }:register()
 
 SimpleEventHook {
-  name = "alixer/prevent-fallback",
+  name = "alixer/wait-for-ingress",
   after = { "linking/find-defined-target" },
   before = { "linking/find-default-target", "linking/find-best-target" },
   interests = {
@@ -113,6 +118,80 @@ SimpleEventHook {
       event:stop_processing()
     end
   end
+}:register()
+
+-- Hold first admission after normal policy has chosen a destination. Remember
+-- that destination for Rust's initial routes without ever linking to it first.
+-- Once admitted, ordinary external moves retain normal desktop semantics.
+local admitted = {}
+SimpleEventHook {
+  name = "alixer/playback-removed",
+  interests = { EventInterest { Constraint { "event.type", "=", "session-item-removed" } } },
+  execute = function(event)
+    admitted[event:get_subject().id] = nil
+  end,
+}:register()
+SimpleEventHook {
+  name = "alixer/prevent-fallback",
+  after = { "linking/find-best-target", "alixer/system-sounds-target" },
+  before = "linking/prepare-link",
+  interests = {
+    EventInterest {
+      Constraint { "event.type", "=", "select-target" },
+      Constraint { "media.class", "=", "Stream/Output/Audio" },
+    },
+  },
+  execute = function(event)
+    local _, om, si, props, _, target = lutils:unwrap_select_target_event(event)
+    if not engine_running() or is_system_sound(props, si) or admitted[si.id]
+        or props["stream.monitor"] == "true" then return end
+    local metadata = cutils.get_default_metadata_object()
+    if not metadata then return end
+    local id = tonumber(props["node.id"])
+    -- Links can survive a WirePlumber restart. Such a stream has already
+    -- started; preserve normal moves instead of putting it back in admission.
+    if cutils.get_object_manager("link"):lookup {
+      Constraint { "link.output.node", "=", id },
+    } then
+      admitted[si.id] = true
+      return
+    end
+    local ready = metadata:find(id, "alixer.playback.ready")
+    local ingress = ready and om:lookup {
+      type = "SiLinkable", Constraint { "node.name", "=", ready },
+    }
+    if ingress then
+      admitted[si.id] = true
+      event:set_data("target", ingress)
+      return
+    end
+    if target and not metadata:find(id, "alixer.playback.target") then
+      metadata:set(id, "alixer.playback.target", "Spa:String", target.properties["node.name"])
+    end
+    -- Native streams need DSP ports before Rust can discover their channels.
+    local format, mode = si:get_ports_format()
+    if mode ~= "dsp" then si:set_ports_format(format, "dsp", function() end) end
+    event:stop_processing()
+  end,
+}:register()
+
+SimpleEventHook {
+  name = "alixer/playback-ready",
+  interests = {
+    EventInterest {
+      Constraint { "event.type", "=", "metadata-changed" },
+      Constraint { "metadata.name", "=", "default" },
+      Constraint { "event.subject.key", "=", "alixer.playback.ready" },
+      Constraint { "event.subject.value", "is-present" },
+    },
+  },
+  execute = function(event)
+    local props = event:get_properties()
+    local si = cutils.get_object_manager("session-item"):lookup {
+      type = "SiLinkable", Constraint { "node.id", "=", props["event.subject.id"] },
+    }
+    if si then event:get_source():call("push-event", "select-target", si, nil) end
+  end,
 }:register()
 
 -- Retry only the waiting event once its processing path is connected.
@@ -172,6 +251,8 @@ SimpleEventHook {
               metadata:set(id, key, nil, nil)
             end
           end
+          metadata:set(id, "alixer.playback.target", nil, nil)
+          metadata:set(id, "alixer.playback.ready", nil, nil)
           metadata:set(id, "alixer.system-sounds.target", nil, nil)
           metadata:set(id, "alixer.system-sounds.ready", nil, nil)
         end

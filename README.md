@@ -43,7 +43,8 @@ preview connections are released when metering stops. Unrouted inputs use separa
 preview filters, so opening or closing the GUI does not attach their capture
 clocks to playback.
 Playback sinks exist only while an application stream needs them, including while
-paused. Saved strips keep their settings without leaving unused output devices.
+paused. New playback waits for its mixer path before the first connection,
+avoiding a brief burst through the desktop output followed by a routing gap. Saved strips keep their settings without leaving unused output devices.
 Stopping or crashing the service releases playback to normal desktop routing
 and removes its playback sinks. The virtual microphone stays silent on ordinary
 shutdown so recording applications do not fall back to a hardware microphone.
@@ -291,8 +292,9 @@ Runtime tests start private PipeWire, WirePlumber, and D-Bus instances with
 temporary config, runtime, and state directories. They do not change desktop audio
 configuration. Live tests require their executables, `pipewire-pulse`, `pactl`,
 `wpctl`, `pw-cli`, `pw-dump`, `pw-play`, `pw-record`, `paplay`, and a C compiler (`cc`)
-for the test-only LV2 fixture. The live test checks uninterrupted playback and
-plugin lifetime while unrelated streams open and close, suspension before and
+for the test-only LV2 fixture. The live test checks clean native/PulseAudio startup, saved mute before the first
+sample, uninterrupted playback and plugin lifetime while unrelated streams open
+and close, suspension before and
 after playback, idle CPU use, and microphone preview cleanup after UI disconnects.
 
 ### Native LV2 tests

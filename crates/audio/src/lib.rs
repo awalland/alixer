@@ -233,6 +233,8 @@ struct Graph {
     objects: BTreeMap<u32, Raw>,
     epoch: String,
     targets: BTreeMap<u32, String>,
+    playback_targets: BTreeMap<u32, String>,
+    playback_ready: BTreeMap<u32, String>,
     system_targets: BTreeMap<u32, String>,
     system_ready: BTreeMap<u32, String>,
     saved_targets: Option<String>,
@@ -289,6 +291,11 @@ impl Graph {
                     .and_then(|v| v.parse::<u32>().ok())
                     == Some(target)
         })
+    }
+    fn has_port_link(&self, source: u32, target: u32) -> bool {
+        self.objects.values().any(|o| o.kind == "Link"
+            && o.props.get("link.output.port").and_then(|v| v.parse::<u32>().ok()) == Some(source)
+            && o.props.get("link.input.port").and_then(|v| v.parse::<u32>().ok()) == Some(target))
     }
     fn ports(&self, node: u32, output: bool) -> Vec<(u32, String, String)> {
         let mut ports: Vec<_> = self
@@ -433,6 +440,25 @@ impl Graph {
                 }
                 targets.sort();
                 targets.dedup();
+                // Admission records policy's destination before any application
+                // link exists. Use the same channel matching as normal routing.
+                if targets.is_empty() && !self.playback_ready.contains_key(&id) {
+                    if let Some(target) = self.playback_targets.get(&id) {
+                        if let Some((&target_id, _)) = self.objects.iter().find(|(_, o)|
+                            o.kind == "Node" && o.props.get("node.name") == Some(target)) {
+                            let target_ports = self.ports(target_id, false);
+                            for (sc, (_, _, source)) in ports.iter().enumerate() {
+                                for (tc, (_, _, dest)) in target_ports.iter().enumerate() {
+                                    if source == dest
+                                        || (ports.len() == 1 && matches!(dest.as_str(), "FL" | "FR" | "MONO"))
+                                        || (target_ports.len() == 1 && matches!(source.as_str(), "FL" | "FR")) {
+                                        targets.push((target.clone(), sc, tc));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 if targets.is_empty() {
                     managed = self
                         .targets
@@ -712,7 +738,13 @@ fn run(
                     let listener = m
                         .add_listener_local()
                         .property(move |subject, key, _, value| {
-                            if key == Some("alixer.system-sounds.ready") {
+                            if key == Some("alixer.playback.target") || key == Some("alixer.playback.ready") {
+                                let mut graph = graph.borrow_mut();
+                                graph.dirty = true;
+                                let entries = if key == Some("alixer.playback.target") { &mut graph.playback_targets } else { &mut graph.playback_ready };
+                                if let Some(value) = value { entries.insert(subject, value.into()); }
+                                else { entries.remove(&subject); }
+                            } else if key == Some("alixer.system-sounds.ready") {
                                 let mut graph = graph.borrow_mut();
                                 graph.dirty = true;
                                 if let Some(value) = value { graph.system_ready.insert(subject, value.into()); }
@@ -746,11 +778,15 @@ fn run(
             move |id| {
                 g.borrow_mut().dirty = true;
                 let removed = g.borrow_mut().objects.remove(&id);
+                g.borrow_mut().playback_targets.remove(&id);
+                g.borrow_mut().playback_ready.remove(&id);
                 g.borrow_mut().system_targets.remove(&id);
                 g.borrow_mut().system_ready.remove(&id);
                 g.borrow_mut().targets.remove(&id);
                 if removed.is_some_and(|raw| raw.kind == "Metadata" && raw.props.get("metadata.name").map(String::as_str) == Some("default")) {
                     g.borrow_mut().saved_targets = None;
+                    g.borrow_mut().playback_targets.clear();
+                    g.borrow_mut().playback_ready.clear();
                     g.borrow_mut().system_targets.clear();
                     g.borrow_mut().system_ready.clear();
                 }
@@ -923,6 +959,7 @@ fn run(
                         }
                     }
                 }
+                let mut admissions = Vec::new();
                 for strip in apply.scene.strips.iter().filter(|s|s.kind==StripKind::Stream&&live_strips.contains(&s.id)&&!apply.suspended.contains(&s.id)) {
                     let name=format!("alixer.input.{}",strip.id);
                     let ingress=g.objects.iter().find(|(_,o)|o.kind=="Node"&&o.props.get("node.name")==Some(&name)).map(|(id,_)|*id);
@@ -938,14 +975,20 @@ fn run(
                                     // A legacy ingress can carry the same strip ID.
                                     // Check the actual node link before considering
                                     // this stream connected to the current engine.
-                                    if !g.has_link(id,ingress){m.set_property(id,"target.object",Some("Spa:Id"),Some(&name));}
+                                    if !g.has_link(id,ingress) {
+                                        if g.playback_targets.contains_key(&id) || !g.playback_ready.contains_key(&id) {
+                                            admissions.push((id, ingress, name.clone(), strip.id));
+                                        } else {
+                                            m.set_property(id,"target.object",Some("Spa:Id"),Some(&name));
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
                     // Keep paused applications attached, but only connect the
                     // monitor while an application is actually producing audio.
-                    if !g.has_running_source(ingress) { continue; }
+                    if !g.has_running_source(ingress) && !admissions.iter().any(|(_, sink, _, _)| *sink == ingress) { continue; }
                     let monitors=g.ports(ingress,true);
                     for (ch,(_,port,_)) in monitors.iter().enumerate() {
                         if let Some(input)=render.input_name(strip.id,ch){
@@ -964,6 +1007,31 @@ fn run(
                             })
                         }else{ports.get(*ch)};
                         if let Some((_,target,_))=target{wire(&core,&g,&mut linked,links,&render.name,port,output,target);}
+                    }
+                }
+                // Release only after every monitor channel and output link is
+                // visible in the server graph, rather than merely requested.
+                if let Some(m) = metadata.borrow().as_ref() {
+                    for (id, ingress, name, strip) in admissions {
+                        let monitors = g.ports(ingress, true);
+                        let inputs = g.objects.iter().find(|(_, o)| o.kind == "Node"
+                            && o.props.get("node.name") == Some(&render.name))
+                            .map(|(&id, _)| g.ports(id, false)).unwrap_or_default();
+                        let channels = apply.scene.strip(strip).map_or(0, |s| s.channels.len());
+                        let input_ready = channels > 0 && monitors.len() == channels
+                            && monitors.iter().enumerate().all(|(ch, (source, _, _))| {
+                                render.input_name(strip, ch).is_some_and(|input|
+                                    inputs.iter().any(|(target, name, _)| name == &input
+                                        && linked.contains(&(*source, *target))
+                                        && g.has_port_link(*source, *target)))
+                            });
+                        let links_ready = linked.iter().all(|(source, target)| g.has_port_link(*source, *target));
+                        if input_ready && links_ready {
+                            if g.playback_targets.contains_key(&id) && g.playback_ready.get(&id) != Some(&name) {
+                                m.set_property(id, "alixer.playback.ready", Some("Spa:String"), Some(&name));
+                            }
+                            m.set_property(id, "target.object", Some("Spa:Id"), Some(&name));
+                        }
                     }
                 }
                 if let Err(e) = sync_previews(&core, &g, apply, &metering, previews, links, &mut linked) {

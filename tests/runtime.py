@@ -173,11 +173,27 @@ with tempfile.TemporaryDirectory(prefix="alixer-test-") as tmp:
                 wav.setparams((2,2,48000,0,"NONE","not compressed"))
                 block=array.array("h",[v for n in range(48000) for v in [int(8000*math.sin(n*2*math.pi*440/48000))]*2]).tobytes()
                 for _ in range(90):wav.writeframesraw(block)
+            def start_capture(name):
+                recording=root/(name+".f32")
+                recorder=spawn(["pw-record","--target","test.speakers","--properties","{ stream.capture.sink = true }","--rate","48000","--channels","2","--format","f32","--raw","--sample-count","96000",str(recording)])
+                time.sleep(.2)
+                return recorder,recording
+            def assert_clean_start(capture):
+                recorder,recording=capture
+                recorder.wait(timeout=8)
+                samples=array.array("f");samples.frombytes(recording.read_bytes())
+                mono=samples[::2]
+                first=next((i for i,v in enumerate(mono) if abs(v)>.005),None)
+                assert first is not None and len(mono)-first>24000,"new stream must start producing audio"
+                windows=[mono[i:i+256] for i in range(first+256,len(mono)-256,256)]
+                assert min(math.sqrt(sum(v*v for v in block)/len(block)) for block in windows)>.001,"new stream must not play a burst followed by an admission dropout"
+            startup=start_capture("native-startup")
             player=spawn(["pw-play","--target","test.speakers",str(path)])
             state=wait(lambda:(s if any(strip["kind"]=="Stream" for strip in s["scene"]["strips"]) else None) if (s:=snapshot()) else None,"playback strip")
             strip=next(s["id"] for s in state["scene"]["strips"] if s["kind"]=="Stream")
             state=wait(lambda:(s if any(p[1]>.1 for p in s["peaks"]) else None) if (s:=snapshot()) else None,"audio rendered through mixer")
             assert strip in snapshot()["active_streams"],"publish exact active strip bindings"
+            assert_clean_start(startup)
             edit(dict(type="AddInsert",strip=strip,uri="urn:alixer:test:continuity"))
             wait(lambda:events.exists() and events.read_text()=="I","native LV2 fixture instantiated")
             wait(lambda:any(p[1]>.1 for p in snapshot()["peaks"]),"audio restored after initial plugin insertion")
@@ -329,15 +345,13 @@ wireplumber.profiles = { main = { custom.alixer-output-name-test = required } }
             wp.terminate();assert wp.wait(timeout=5)==0
             wp=spawn(["wireplumber"])
             wait(lambda:pulse_name()=="test.speakers","reset removes global name override")
-            if "ALIXER_TEST_BIN_DIR" in os.environ:
-                # Simulate package removal: the user fragment survives, but the
-                # package-owned script is no longer on WirePlumber's data path.
-                wp.terminate();assert wp.wait(timeout=5)==0
-                env["XDG_DATA_DIRS"]="/usr/local/share:/usr/share"
-                wp=spawn(["wireplumber"])
-                time.sleep(1)
-                assert wp.poll() is None,"leftover optional activation must not break WirePlumber"
-                command(["wpctl","status"])
+            graph=json.loads(command(["pw-dump"]))
+            stream_node=next(o["id"] for o in graph if o.get("info",{}).get("props",{}).get("media.class")=="Stream/Output/Audio")
+            wait(lambda:stream_at("alixer.input."+strip),"existing playback readmitted after WirePlumber restart")
+            for target in ("test.rulecheck","test.speakers"):
+                command(["pw-metadata",str(stream_node),"target.object",target,"Spa:Id"])
+                wait(lambda:any(r["source"]==strip and r["destination"]==dict(kind="Output",id=target) for r in snapshot()["scene"]["routes"]),"external move remains available after admission")
+                wait(lambda:any(s["managed"] for s in snapshot()["observation"]["streams"]),"externally moved stream returns through mixer")
             player.terminate(); player.wait(timeout=5)
             wait(engine_idle, "mixer suspends after playback ends, including saved LV2 strips")
             wait(lambda:not playback_sinks(),"last playback sink collected")
@@ -357,7 +371,38 @@ wireplumber.profiles = { main = { custom.alixer-output-name-test = required } }
             wait(lambda:any(p[1]>.01 for p in snapshot()["peaks"]),"audio restored after external sink removal")
             player.terminate();player.wait(timeout=5)
             wait(lambda:not playback_sinks(),"recreated sink collected after app exits")
-            print("PASS: native discovery/DSP, uninterrupted stream changes/LV2 reuse, exact active strips, legacy Lixer ingress handover, live aux controls, retained/deleted masters, device controls, downtime/hotplug reconciliation, and global output names/reset through WirePlumber and PulseAudio")
+            # PulseAudio clients also wait for the complete path before their
+            # first buffer; their sink timing protocol differs from pw-play.
+            startup=start_capture("pulse-startup")
+            pulse_player=spawn(["paplay","--device=test.speakers",str(path)])
+            wait(lambda:any(s["managed"] for s in snapshot()["observation"]["streams"]),"new PulseAudio stream admitted")
+            assert_clean_start(startup)
+            pulse_strip=next(s["id"] for s in snapshot()["scene"]["strips"] if s["kind"]=="Stream" and s["id"] in snapshot()["active_streams"])
+            edit(dict(type="Mute",strip=pulse_strip,value=True))
+            wait(lambda:all(p[1]<.00001 for p in snapshot()["peaks"]),"mute applied before retiring the first PulseAudio stream")
+            pulse_player.terminate();pulse_player.wait(timeout=5)
+            wait(lambda:not playback_sinks(),"PulseAudio sink collected")
+            startup=start_capture("muted-pulse-startup")
+            pulse_player=spawn(["paplay","--device=test.speakers",str(path)])
+            wait(lambda:pulse_strip in snapshot()["active_streams"],"muted returning PulseAudio stream bound")
+            recorder,recording=startup
+            recorder.wait(timeout=8)
+            samples=array.array("f");samples.frombytes(recording.read_bytes())
+            assert samples and max(abs(v) for v in samples)<.00001,"saved mute must apply before any startup audio reaches the device"
+            edit(dict(type="Mute",strip=pulse_strip,value=False))
+            wait(lambda:any(p[1]>.01 for p in snapshot()["peaks"]),"admitted muted stream resumes normally")
+            pulse_player.terminate();pulse_player.wait(timeout=5)
+            wait(lambda:not playback_sinks(),"returning PulseAudio sink collected")
+            if "ALIXER_TEST_BIN_DIR" in os.environ:
+                # Simulate package removal: the user fragment survives, but the
+                # package-owned script is no longer on WirePlumber's data path.
+                wp.terminate();assert wp.wait(timeout=5)==0
+                env["XDG_DATA_DIRS"]="/usr/local/share:/usr/share"
+                wp=spawn(["wireplumber"])
+                time.sleep(1)
+                assert wp.poll() is None,"leftover optional activation must not break WirePlumber"
+                command(["wpctl","status"])
+            print("PASS: clean native/PulseAudio startup and saved mute, external moves, native discovery/DSP, uninterrupted stream changes/LV2 reuse, exact active strips, legacy Lixer ingress handover, live aux controls, retained/deleted masters, device controls, downtime/hotplug reconciliation, and global output names/reset through WirePlumber and PulseAudio")
     except Exception:
         for i,log in enumerate(logs):
             log.flush();log.seek(0);print("\n--- child",i,"---\n",log.read()[-12000:],file=sys.stderr)
