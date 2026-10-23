@@ -3,6 +3,24 @@ use super::*;
 #[derive(Clone, Copy)]
 struct StripDrag(Id);
 
+const OFFLINE_GRACE: f64 = 1.0;
+const HIDE_TRANSITION: f64 = 0.25;
+
+// Only channels observed online get a grace period. Saved offline channels
+// should not flash into view when opening the mixer.
+fn presence(presence: &mut BTreeMap<Id, Option<f64>>, id: Id, online: bool, now: f64) -> f32 {
+    if online {
+        presence.insert(id, None);
+        return 1.0;
+    }
+    let Some(missing_since) = presence.get_mut(&id) else {
+        return 0.0;
+    };
+    let elapsed = now - *missing_since.get_or_insert(now);
+    let t = ((elapsed - OFFLINE_GRACE) / HIDE_TRANSITION).clamp(0.0, 1.0) as f32;
+    1.0 - t * t * (3.0 - 2.0 * t)
+}
+
 fn section(kind: &StripKind) -> u8 {
     match kind {
         StripKind::Stream => 0,
@@ -16,6 +34,60 @@ fn section(kind: &StripKind) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_channels_wait_a_full_second_and_reconnection_resets_the_delay() {
+        let strip = Strip::new("Browser", StripKind::Stream, vec![]);
+        let mut state = BTreeMap::new();
+        assert_eq!(presence(&mut state, strip.id, false, 0.0), 0.0);
+        assert_eq!(presence(&mut state, strip.id, true, 0.0), 1.0);
+        assert_eq!(presence(&mut state, strip.id, false, 0.1), 1.0);
+        assert_eq!(presence(&mut state, strip.id, false, 1.099), 1.0);
+        assert_eq!(presence(&mut state, strip.id, true, 1.1), 1.0);
+        assert_eq!(presence(&mut state, strip.id, false, 2.0), 1.0);
+        assert_eq!(presence(&mut state, strip.id, false, 3.0), 1.0);
+        assert_eq!(presence(&mut state, strip.id, false, 3.125), 0.5);
+        assert_eq!(presence(&mut state, strip.id, false, 3.25), 0.0);
+    }
+
+    #[test]
+    fn offline_playback_fades_and_collapses_without_replacing_its_strip() {
+        let mut h = Harness::new(vec![StripKind::Stream, StripKind::Group], false);
+        h.app.show_inactive = false;
+        let id = h.snapshot.scene.strips[0].id;
+        h.snapshot.active_streams = Some(vec![id]);
+        h.frame(vec![]);
+        let original_x = h.labels["Channel 1"].x;
+        h.snapshot.active_streams = Some(vec![]);
+        h.frame(vec![]);
+        let missing_since = h.time;
+        h.time = missing_since + 0.9;
+        h.frame(vec![]);
+        assert_eq!(h.labels["Channel 1"].x, original_x);
+        assert!(h.labels.contains_key("Channel 0"));
+
+        // A seek that reconnects during the grace period keeps the same layout.
+        h.snapshot.active_streams = Some(vec![id]);
+        h.frame(vec![]);
+        assert_eq!(h.labels["Channel 1"].x, original_x);
+        h.snapshot.active_streams = Some(vec![]);
+        h.frame(vec![]);
+        let missing_since = h.time;
+        h.time = missing_since + 1.075;
+        h.frame(vec![]);
+        let halfway_x = h.labels["Channel 1"].x;
+        assert!(halfway_x < original_x);
+        h.time = missing_since + 1.25;
+        h.frame(vec![]);
+        assert!(!h.labels.contains_key("Channel 0"));
+        assert!(h.labels["Channel 1"].x < halfway_x);
+        assert_eq!(h.snapshot.scene.strips[0].id, id);
+
+        h.app.show_inactive = true;
+        h.frame(vec![]);
+        assert!(h.labels.contains_key("Channel 0"));
+        assert_eq!(h.labels["Channel 1"].x, original_x);
+    }
 
     #[test]
     fn system_sounds_sits_before_outputs_with_no_routing_or_insert_controls() {
@@ -348,6 +420,8 @@ impl App {
 
     pub(super) fn strip_bank(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot, height: f32) {
         let mut rects = vec![];
+        let now = ui.input(|i| i.time);
+        self.strip_presence.retain(|id, _| snapshot.scene.strip(*id).is_some());
         ui.horizontal_top(|ui| {
             let mut previous = None;
             for bank in 0..5 {
@@ -371,16 +445,49 @@ impl App {
                             .any(|o| Some(&o.key) == strip.output_key.as_ref()),
                         _ => true,
                     };
-                    if !online && !self.show_inactive && !conflict_ui::has_strip_conflict(snapshot, strip.id) {
+                    let presence = presence(&mut self.strip_presence, strip.id, online, now);
+                    let visibility = if self.show_inactive || conflict_ui::has_strip_conflict(snapshot, strip.id) {
+                        1.0
+                    } else {
+                        presence
+                    };
+                    if visibility == 0.0 {
                         continue;
+                    }
+                    if !online && !self.show_inactive && presence == 1.0 {
+                        if let Some(Some(since)) = self.strip_presence.get(&strip.id) {
+                            ui.ctx().request_repaint_after(Duration::from_secs_f64(
+                                (since + OFFLINE_GRACE - now).max(0.001),
+                            ));
+                        }
                     }
                     if previous.is_some_and(|previous| previous != bank) {
                         ui.separator();
                     }
                     previous = Some(bank);
+                    let width_id = ui.id().with(("strip-width", strip.id));
+                    if visibility < 1.0 {
+                        // Render at full size while shrinking the allocated space,
+                        // so controls stay fixed and neighboring strips slide over.
+                        let mut child = ui.new_child(egui::UiBuilder::new()
+                            .id_salt(strip.id)
+                            .max_rect(ui.available_rect_before_wrap()));
+                        let full_width = ui.ctx().data(|data| data.get_temp::<f32>(width_id)).unwrap_or(162.0);
+                        let width = ((full_width + ui.spacing().item_spacing.x) * visibility
+                            - ui.spacing().item_spacing.x).max(0.0);
+                        let visible_rect = egui::Rect::from_min_size(child.max_rect().min, Vec2::new(width, height));
+                        child.set_clip_rect(ui.clip_rect().intersect(visible_rect));
+                        child.disable();
+                        child.multiply_opacity(visibility);
+                        self.strip(&mut child, strip, snapshot, height);
+                        ui.advance_cursor_after_rect(visible_rect);
+                        ui.ctx().request_repaint();
+                        continue;
+                    }
                     let rect = ui
                         .push_id(strip.id, |ui| self.strip(ui, strip, snapshot, height))
                         .inner;
+                    ui.ctx().data_mut(|data| data.insert_temp(width_id, rect.width()));
                     rects.push((strip, rect));
                 }
             }

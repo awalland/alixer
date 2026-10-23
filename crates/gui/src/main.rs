@@ -64,6 +64,7 @@ struct App {
     confirm_output_names: bool,
     filter: String,
     show_inactive: bool,
+    strip_presence: BTreeMap<Id, Option<f64>>,
     names: BTreeMap<Id, String>,
     preferences: preferences::Preferences,
 }
@@ -222,6 +223,7 @@ impl App {
             confirm_output_names: false,
             filter: String::new(),
             show_inactive: false,
+            strip_presence: BTreeMap::new(),
             names: BTreeMap::new(),
             preferences,
         }
@@ -797,6 +799,7 @@ fn test_app() -> (App, mpsc::Receiver<Command>) {
         confirm_output_names: false,
         filter: String::new(),
         show_inactive: false,
+        strip_presence: BTreeMap::new(),
         names: BTreeMap::new(),
         preferences: preferences::Preferences::load(
             std::env::temp_dir().join("alixer-layout-unused.json"),
