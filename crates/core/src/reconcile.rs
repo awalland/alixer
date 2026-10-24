@@ -29,12 +29,13 @@ pub fn reconcile(
 ) -> Reconciled {
     let mut result = Reconciled {
         scene: saved.clone(),
-        // Older versions suspended recreated streams until "Restore saved" was chosen.
-        // Drop those persisted conflicts so saved routing resumes automatically.
+        // Older versions suspended recreated or indistinguishable streams.
+        // Clear those notices so already affected playback can resume.
         conflicts: existing
             .iter()
             .filter(|c| {
                 c.message != "Stream was recreated; outside routing intent cannot be inferred"
+                    && c.message != "Returning streams are indistinguishable; saved settings were not assigned"
             })
             .cloned()
             .collect(),
@@ -195,29 +196,31 @@ pub fn reconcile(
             })
             .map(|s| s.id)
             .collect();
-        let count = actual
+        // Surviving incarnations already have reserved strips. Only unmatched
+        // streams compete for the remaining saved settings.
+        let returning = actual
             .streams
             .iter()
-            .filter(|s| s.identity == stream.identity)
+            .filter(|s| s.identity == stream.identity
+                && !baseline.bindings.get(&runtime_key(&s.runtime))
+                    .is_some_and(|id| saved.strip(*id).is_some()))
             .count();
+        // Browsers can briefly overlap streams when seeking. Once the old node
+        // disappears, prefer the sole recently observed candidate over older,
+        // offline strips left by earlier overlaps.
+        let recent: Vec<_> = candidates.iter().copied()
+            .filter(|id| baseline.bindings.values().any(|bound| bound == id))
+            .collect();
         let id = if let Some(id) = exact {
             id
-        } else if candidates.len() == 1 && count == 1 {
+        } else if returning == 1 && recent.len() == 1 {
+            recent[0]
+        } else if returning == 1 && candidates.len() == 1 {
             candidates[0]
-        } else if candidates.is_empty() {
-            let mut strip = Strip::new(
-                &stream.identity.name,
-                StripKind::Stream,
-                stream.identity.channels.clone(),
-            );
-            strip.identity = Some(stream.identity.clone());
-            let id = strip.id;
-            result.scene.strips.push(strip);
-            replace_outputs(&mut result.scene, id, &stream.targets);
-            id
         } else {
-            // Give every live stream a complete, independent strip without stealing
-            // an indistinguishable saved strip's settings.
+            // Ambiguous identity is not an outside routing edit. Use an
+            // independent default strip rather than suspending playback or
+            // assigning another stream's saved controls.
             let mut strip = Strip::new(
                 &stream.identity.name,
                 StripKind::Stream,
@@ -227,12 +230,6 @@ pub fn reconcile(
             let id = strip.id;
             result.scene.strips.push(strip);
             replace_outputs(&mut result.scene, id, &stream.targets);
-            conflict(
-                &mut result.conflicts,
-                Some(id),
-                "Returning streams are indistinguishable; saved settings were not assigned",
-                &stream.targets,
-            );
             id
         };
         if !claimed.insert(id) {
@@ -534,6 +531,84 @@ mod tests {
                 id
             );
         }
+    }
+
+    #[test]
+    fn replacement_reuses_unreserved_strip_while_identical_stream_survives() {
+        let mut actual = Observation { streams: vec![stream(), stream()], ..Default::default() };
+        actual.streams[1].runtime.serial = "43".into();
+        let first = reconcile(&Scene::default(), &Checkpoint::default(), &actual, &[]);
+        assert!(first.conflicts.is_empty());
+        let baseline = Checkpoint { observation: actual.clone(), bindings: first.bindings.clone() };
+        let replaced = first.bindings[&runtime_key(&actual.streams[0].runtime)];
+        actual.streams[0].runtime.serial = "44".into();
+        for streams in [actual.streams.clone(), actual.streams.iter().cloned().rev().collect()] {
+            let next = reconcile(&first.scene, &baseline, &Observation { streams, ..actual.clone() }, &[]);
+            assert!(next.conflicts.is_empty());
+            assert_eq!(next.scene, first.scene);
+            assert_eq!(next.bindings[&runtime_key(&actual.streams[0].runtime)], replaced);
+            assert_eq!(next.bindings[&runtime_key(&actual.streams[1].runtime)],
+                first.bindings[&runtime_key(&actual.streams[1].runtime)]);
+        }
+    }
+
+    #[test]
+    fn repeated_seeks_reuse_recent_strip_after_browser_streams_overlap() {
+        let mut actual = Observation { streams: vec![stream()], ..Default::default() };
+        let first = reconcile(&Scene::default(), &Checkpoint::default(), &actual, &[]);
+        let old = first.bindings[&runtime_key(&actual.streams[0].runtime)];
+        let baseline = Checkpoint { observation: actual.clone(), bindings: first.bindings };
+        let mut replacement = stream();
+        replacement.runtime.serial = "43".into();
+        actual.streams.push(replacement);
+        let overlap = reconcile(&first.scene, &baseline, &actual, &[]);
+        assert!(overlap.conflicts.is_empty());
+        let id = overlap.bindings[&runtime_key(&actual.streams[1].runtime)];
+        assert_ne!(old, id, "a new stream cannot steal a live stream's strip");
+        let baseline = Checkpoint { observation: actual.clone(), bindings: overlap.bindings };
+        actual.streams.remove(0);
+        let alone = reconcile(&overlap.scene, &baseline, &actual, &[]);
+        let mut scene = alone.scene;
+        scene.strips.iter_mut().find(|s| s.id == id).unwrap().gain = 0.3;
+        let mut checkpoint = Checkpoint { observation: actual.clone(), bindings: alone.bindings };
+        for serial in 44..50 {
+            actual.streams[0].runtime.serial = serial.to_string();
+            let next = reconcile(&scene, &checkpoint, &actual, &[]);
+            assert!(next.conflicts.is_empty());
+            assert_eq!(next.scene, scene, "seeking must retain the mix without adding strips");
+            assert_eq!(next.bindings[&runtime_key(&actual.streams[0].runtime)], id);
+            checkpoint = Checkpoint { observation: actual.clone(), bindings: next.bindings };
+        }
+    }
+
+    #[test]
+    fn ambiguous_return_plays_without_assigning_saved_controls() {
+        let actual = Observation { streams: vec![stream()], ..Default::default() };
+        let first = reconcile(&Scene::default(), &Checkpoint::default(), &actual, &[]);
+        let mut saved = first.scene;
+        let mut duplicate = saved.strips[0].clone();
+        duplicate.id = Id::new_v4();
+        duplicate.mute = true;
+        saved.strips[0].gain = 0.2;
+        saved.strips.push(duplicate);
+        let next = reconcile(&saved, &Checkpoint::default(), &actual, &[]);
+        assert!(next.conflicts.is_empty());
+        let id = next.bindings[&runtime_key(&actual.streams[0].runtime)];
+        assert!(saved.strip(id).is_none());
+        assert_eq!(next.scene.strip(id).unwrap().gain, 1.0);
+        assert!(!next.scene.strip(id).unwrap().mute);
+        assert!(next.scene.routes.iter().any(|r| r.source == id));
+        for strip in &saved.strips {
+            assert_eq!(next.scene.strip(strip.id), Some(strip));
+        }
+        let mut existing = vec![];
+        conflict(&mut existing, Some(id),
+            "Returning streams are indistinguishable; saved settings were not assigned", &[]);
+        conflict(&mut existing, Some(saved.strips[0].id),
+            "Stream is disconnected; preserve current silence until resolved", &[]);
+        let recovered = reconcile(&next.scene,
+            &Checkpoint { observation: actual.clone(), bindings: next.bindings }, &actual, &existing);
+        assert_eq!(recovered.conflicts, existing[1..]);
     }
 
     #[test]
