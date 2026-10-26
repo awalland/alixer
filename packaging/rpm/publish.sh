@@ -5,7 +5,7 @@
 # from publish.env.example; it needs:
 #   GITEA_BASE_URL=https://git.home
 #   GITEA_USERNAME=yourname
-#   GITEA_PACKAGE_OWNER=stuff
+#   GITEA_PACKAGE_OWNER=packages
 #   GITEA_TOKEN=...   # scoped token with write:package only
 set -euo pipefail
 root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"

@@ -43,7 +43,7 @@ Publishing reads `publish.env` in the repository root (mode 600, gitignored) or
 the file named by `ALIXER_PUBLISH_CONFIG`. Start from the template that sits
 next to it: `install -m 600 publish.env.example publish.env`, then edit it. It needs
 `GITEA_BASE_URL`, `GITEA_USERNAME`, `GITEA_PACKAGE_OWNER` (the user or
-organisation that owns the registry, `stuff` in the examples) and `GITEA_TOKEN`.
+organisation that owns the registry, `packages` in the examples) and `GITEA_TOKEN`.
 Create the token in Gitea under Settings / Applications with only the
 `write:package` scope. Only RPMs matching the workspace version are uploaded, so
 stale artifacts under target/rpm are never published. The token is passed to
