@@ -4,11 +4,13 @@ root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$root"
 mode=build
 rpm_options=()
+publish=false
 for arg in "$@"; do
     case "$arg" in
         --prepare-only) mode=prepare ;;
         --skip-build-deps) rpm_options+=(--nodeps) ;;
-        *) echo "Usage: $0 [--prepare-only] [--skip-build-deps]" >&2; exit 2 ;;
+        --publish) publish=true ;;
+        *) echo "Usage: $0 [--prepare-only] [--skip-build-deps] [--publish]" >&2; exit 2 ;;
     esac
 done
 for tool in cargo rustc jq rg tar zstd rpmbuild; do command -v "$tool" >/dev/null; done
@@ -51,4 +53,7 @@ if [[ "$mode" == build ]]; then
         --define "alixer_jobs ${CARGO_BUILD_JOBS:-2}" "$top/SPECS/alixer.spec"
     echo "Binary RPMs: $top/RPMS"
     echo "Source RPMs: $top/SRPMS"
+    if $publish; then
+        bash "$root/packaging/rpm/publish.sh"
+    fi
 fi

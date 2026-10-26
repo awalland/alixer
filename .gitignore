@@ -1,3 +1,5 @@
 /target
 *.sqlite*
+# real credentials, only publish.env.example is tracked
+publish.env
 

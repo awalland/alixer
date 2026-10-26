@@ -10,6 +10,15 @@ PipeWire/SPA and SQLite development packages, pkg-config, systemd RPM macros,
 desktop-file-utils, rpmbuild, zstd, jq and ripgrep. On Tumbleweed the native
 development packages include pipewire-devel, sqlite3-devel and libclang13.
 
+A `cargo rpm` subcommand wraps the scripts in this directory. Link it once:
+
+```sh
+ln -s "$PWD/packaging/rpm/cargo-rpm.sh" ~/.cargo/bin/cargo-rpm
+```
+
+Then `cargo rpm [build|check|publish] [args...]` runs the matching script
+(`build` is the default).
+
 Run from the checkout:
 
 ```sh
@@ -22,6 +31,24 @@ before rpmbuild; compilation and tests run with Cargo's --frozen flag. Artifacts
 and build caches are kept under target/rpm. Build concurrency defaults to two
 jobs; CARGO_BUILD_JOBS overrides it.
 
+Publish the RPMs of the current workspace version to the Gitea RPM registry:
+
+```sh
+bash packaging/rpm/build.sh --publish
+# or, after a previous build:
+bash packaging/rpm/publish.sh
+```
+
+Publishing reads `publish.env` in the repository root (mode 600, gitignored) or
+the file named by `ALIXER_PUBLISH_CONFIG`. Start from the template that sits
+next to it: `install -m 600 publish.env.example publish.env`, then edit it. It needs
+`GITEA_BASE_URL`, `GITEA_USERNAME`, `GITEA_PACKAGE_OWNER` (the user or
+organisation that owns the registry, `stuff` in the examples) and `GITEA_TOKEN`.
+Create the token in Gitea under Settings / Applications with only the
+`write:package` scope. Only RPMs matching the workspace version are uploaded, so
+stale artifacts under target/rpm are never published. The token is passed to
+curl via stdin, never as a command-line argument.
+
 If Rust is provided by rustup rather than RPM, RPM's build-dependency check may
 not recognize it. After verifying all required tools/libraries are installed,
 use `bash packaging/rpm/build.sh --skip-build-deps`. This does not make the
@@ -33,7 +60,7 @@ The RPM requires the LSP LV2 effects package (`lv2-lsp-plugins` on openSUSE,
 Install the matching binary RPM with zypper (replace the filename as needed):
 
 ```sh
-sudo zypper install ./target/rpm/RPMS/x86_64/alixer-0.2.10-1.x86_64.rpm
+sudo zypper install ./target/rpm/RPMS/x86_64/alixer-0.2.11-1.x86_64.rpm
 alixerctl enable
 systemctl --user daemon-reload
 systemctl --user restart wireplumber.service
