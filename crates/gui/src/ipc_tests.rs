@@ -71,3 +71,75 @@ fn catalog_can_take_longer_than_the_control_connection_deadline() {
     assert_eq!(fetch_catalog(client).unwrap(), serde_json::json!([]));
     worker.join().unwrap();
 }
+
+#[test]
+fn ui_worker_reconnects_and_refreshes_revision_after_daemon_restart() {
+    use std::os::unix::net::UnixListener;
+    let dir = std::env::temp_dir().join(format!("alixer-reconnect-{}", Id::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.join("control.sock");
+    let (commands, commands_rx) = mpsc::channel();
+    let (events_tx, events) = mpsc::channel();
+    let worker_path = path.clone();
+    let worker = std::thread::spawn(move || {
+        ipc_worker(worker_path, commands_rx, events_tx, egui::Context::default());
+    });
+    let mut app = test_app().0;
+    app.rx = events;
+    fn wait_for(app: &mut App, predicate: impl Fn(&App) -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            app.receive_events();
+            if predicate(app) { return; }
+            assert!(std::time::Instant::now() < deadline, "UI did not reconnect");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    // Startup before the daemon exists must recover, too.
+    wait_for(&mut app, |app| !app.connection_error.is_empty());
+    for revision in [99, 3, 7] {
+        let listener = UnixListener::bind(&path).unwrap();
+        // Queue an edit before connecting; the worker must first read the new
+        // daemon's revision rather than reuse the preceding process's revision.
+        commands.send(Command::Edit(Edit::AddBus {
+            name: "After restart".into(), aux: false, channels: vec!["FL".into()],
+        })).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        server.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut reader = BufReader::new(server.try_clone().unwrap());
+        for expected_snapshot in [true, false] {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let request: Request = serde_json::from_str(&line).unwrap();
+            let result = if expected_snapshot {
+                assert!(matches!(request.command, Command::Snapshot));
+                Ok(Payload::Snapshot(Snapshot {
+                    scene: Scene { revision, ..Default::default() },
+                    active_streams: Some(vec![]), observation: Observation::default(),
+                    conflicts: vec![], status: "Connected".into(), peaks: vec![],
+                    channel_peaks: vec![], plugin_meters: vec![],
+                }))
+            } else {
+                assert!(matches!(request.command, Command::Edit(_)));
+                assert_eq!(request.revision, Some(revision));
+                // Ordinary command errors should remain visible after reconnect.
+                Err("Example command error".into())
+            };
+            serde_json::to_writer(&mut server, &Reply {
+                version: VERSION, id: request.id, revision, result,
+            }).unwrap();
+            server.write_all(b"\n").unwrap();
+        }
+        wait_for(&mut app, |app| app.connection_error.is_empty()
+            && app.snapshot.as_ref().is_some_and(|s| s.scene.revision == revision)
+            && app.error == "Example command error");
+        drop(reader);
+        drop(server);
+        drop(listener);
+        std::fs::remove_file(&path).unwrap();
+        wait_for(&mut app, |app| !app.connection_error.is_empty());
+    }
+    drop(app);
+    worker.join().unwrap();
+    std::fs::remove_dir(dir).unwrap();
+}

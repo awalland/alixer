@@ -775,6 +775,8 @@ fn run(
         .global_remove({
             let g = graph.clone();
             let keep = proxies.clone();
+            let md = metadata.clone();
+            let md_listener = metadata_listener.clone();
             move |id| {
                 g.borrow_mut().dirty = true;
                 let removed = g.borrow_mut().objects.remove(&id);
@@ -784,6 +786,12 @@ fn run(
                 g.borrow_mut().system_ready.remove(&id);
                 g.borrow_mut().targets.remove(&id);
                 if removed.is_some_and(|raw| raw.kind == "Metadata" && raw.props.get("metadata.name").map(String::as_str) == Some("default")) {
+                    // WirePlumber owns this object. A replacement needs a new
+                    // proxy/listener, and none of the removed object's values
+                    // may describe the new session's routing.
+                    md_listener.borrow_mut().take();
+                    md.borrow_mut().take();
+                    g.borrow_mut().targets.clear();
                     g.borrow_mut().saved_targets = None;
                     g.borrow_mut().playback_targets.clear();
                     g.borrow_mut().playback_ready.clear();
@@ -840,6 +848,17 @@ fn run(
     let timer=mainloop.loop_().add_timer(move|_|{
         if stop.load(Ordering::Acquire){loop_quit.quit();return;}
         if !ready.get(){return;}
+        // WirePlumber replaces default metadata when it restarts. Keep the
+        // existing DSP and saved routing through that gap: temporary link loss
+        // is not evidence of an external disconnect.
+        if metadata.borrow().is_none() {
+            let _ = updates.send(Update {
+                observation: activity.borrow().observation.clone(),
+                status: "Reconnecting to WirePlumber".into(),
+                peaks: vec![], channel_peaks: vec![], plugin_meters: vec![], states: vec![],
+            });
+            return;
+        }
         let mut activity = activity.borrow_mut();
         let Activity { observation: previous_observation, topology_pending, had_consumers, latency_overflow: previous_overflow, last_meter_request } = &mut *activity;
         let graph_changed = {

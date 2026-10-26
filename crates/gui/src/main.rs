@@ -44,6 +44,7 @@ fn output_masters(snapshot: &Snapshot, show_offline: bool) -> impl Iterator<Item
 enum Event {
     Snapshot(Snapshot),
     Error(String),
+    Disconnected(String),
     Catalog(Result<serde_json::Value, String>),
 }
 struct App {
@@ -51,6 +52,7 @@ struct App {
     rx: mpsc::Receiver<Event>,
     snapshot: Option<Snapshot>,
     error: String,
+    connection_error: String,
     selected: Option<Id>,
     new_bus: Option<bool>,
     bus_name: String,
@@ -114,7 +116,125 @@ fn fetch_catalog(mut stream: UnixStream) -> Result<serde_json::Value, String> {
         _ => Err("Unexpected plugin catalog response".into()),
     }
 }
+fn ipc_worker(
+    socket_path: std::path::PathBuf,
+    commands: mpsc::Receiver<Command>,
+    events: mpsc::Sender<Event>,
+    ctx: egui::Context,
+) {
+    let mut revision = None;
+    let mut socket: Option<UnixStream> = None;
+    loop {
+        if socket.is_none() {
+            match UnixStream::connect(socket_path.clone()) {
+                Ok(s) => {
+                    let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
+                    let _ = s.set_write_timeout(Some(Duration::from_secs(2)));
+                    socket = Some(s);
+                }
+                Err(e) => {
+                    if events
+                        .send(Event::Disconnected(format!(
+                            "Reconnecting to service · {e}"
+                        )))
+                        .is_err()
+                    {
+                        return;
+                    }
+                    ctx.request_repaint();
+                    std::thread::sleep(Duration::from_millis(500));
+                    continue;
+                }
+            }
+        }
+        let stream = socket.as_mut().unwrap();
+        let mut failure = None;
+        // A replacement daemon may have a different revision. Refresh before
+        // sending queued edits, including the first request after a restart.
+        match exchange(stream, Command::Snapshot, None) {
+            Ok(reply) => {
+                revision = Some(reply.revision);
+                match reply.result {
+                    Ok(Payload::Snapshot(snapshot)) => {
+                        if events.send(Event::Snapshot(snapshot)).is_err() {
+                            return;
+                        }
+                    }
+                    Err(e) => failure = Some(e),
+                    _ => failure = Some("Unexpected service snapshot response".into()),
+                }
+            }
+            Err(e) => failure = Some(e),
+        }
+        if failure.is_none() {
+            for command in commands.try_iter() {
+                if matches!(command, Command::Plugins) {
+                    let events = events.clone();
+                    let ctx = ctx.clone();
+                    let socket_path = socket_path.clone();
+                    std::thread::spawn(move || {
+                        let result = UnixStream::connect(socket_path.clone())
+                            .map_err(|e| format!("Service unavailable · {e}"))
+                            .and_then(fetch_catalog);
+                        let _ = events.send(Event::Catalog(result));
+                        ctx.request_repaint();
+                    });
+                    continue;
+                }
+                match exchange(stream, command, revision) {
+                    Ok(reply) => {
+                        revision = Some(reply.revision);
+                        match reply.result {
+                            Err(e) => {
+                                let _ = events.send(Event::Error(e));
+                            }
+                            _ => {}
+                        }
+                    }
+                    Err(e) => {
+                        failure = Some(e);
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some(e) = failure {
+            let _ = events.send(Event::Disconnected(format!(
+                "Reconnecting to service · {e}"
+            )));
+            socket = None;
+            revision = None;
+        }
+        ctx.request_repaint();
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
 impl App {
+    fn receive_events(&mut self) {
+        while let Ok(event) = self.rx.try_recv() {
+            match event {
+                Event::Snapshot(snapshot) => {
+                    self.connection_error.clear();
+                    if snapshot.scene.strips.iter().any(|s| !s.inserts.is_empty()) {
+                        self.ensure_catalog();
+                    }
+                    self.snapshot = Some(snapshot);
+                }
+                Event::Error(e) => self.error = e,
+                Event::Disconnected(e) => self.connection_error = e,
+                Event::Catalog(result) => {
+                    self.catalog_loading = false;
+                    match result {
+                        Ok(value) => {
+                            self.catalog = value;
+                            self.catalog_error.clear();
+                        }
+                        Err(e) => self.catalog_error = e,
+                    }
+                }
+            }
+        }
+    }
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let preferences = preferences::Preferences::load(state_dir().join("ui.json"));
         cc.egui_ctx.set_zoom_factor(preferences.zoom);
@@ -129,87 +249,13 @@ impl App {
         let (tx, commands) = mpsc::channel();
         let (events, rx) = mpsc::channel();
         let ctx = cc.egui_ctx.clone();
-        std::thread::spawn(move || {
-            let mut revision = None;
-            let mut socket: Option<UnixStream> = None;
-            loop {
-                if socket.is_none() {
-                    match UnixStream::connect(runtime_dir().join("control.sock")) {
-                        Ok(s) => {
-                            let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
-                            let _ = s.set_write_timeout(Some(Duration::from_secs(2)));
-                            socket = Some(s);
-                        }
-                        Err(e) => {
-                            if events
-                                .send(Event::Error(format!("Service unavailable · {e}")))
-                                .is_err()
-                            {
-                                return;
-                            }
-                            ctx.request_repaint();
-                            std::thread::sleep(Duration::from_millis(500));
-                            continue;
-                        }
-                    }
-                }
-                let stream = socket.as_mut().unwrap();
-                let mut failure = None;
-                for command in commands.try_iter() {
-                    if matches!(command, Command::Plugins) {
-                        let events = events.clone();
-                        let ctx = ctx.clone();
-                        std::thread::spawn(move || {
-                            let result = UnixStream::connect(runtime_dir().join("control.sock"))
-                                .map_err(|e| format!("Service unavailable · {e}"))
-                                .and_then(fetch_catalog);
-                            let _ = events.send(Event::Catalog(result));
-                            ctx.request_repaint();
-                        });
-                        continue;
-                    }
-                    match exchange(stream, command, revision) {
-                        Ok(reply) => {
-                            revision = Some(reply.revision);
-                            match reply.result {
-                                Err(e) => {
-                                    let _ = events.send(Event::Error(e));
-                                }
-                                _ => {}
-                            }
-                        }
-                        Err(e) => {
-                            failure = Some(e);
-                            break;
-                        }
-                    }
-                }
-                if failure.is_none() {
-                    match exchange(stream, Command::Snapshot, None) {
-                        Ok(reply) => {
-                            revision = Some(reply.revision);
-                            if let Ok(Payload::Snapshot(snapshot)) = reply.result {
-                                if events.send(Event::Snapshot(snapshot)).is_err() {
-                                    return;
-                                }
-                            }
-                        }
-                        Err(e) => failure = Some(e),
-                    }
-                }
-                if let Some(e) = failure {
-                    let _ = events.send(Event::Error(e));
-                    socket = None;
-                }
-                ctx.request_repaint();
-                std::thread::sleep(Duration::from_millis(100));
-            }
-        });
+        std::thread::spawn(move || ipc_worker(runtime_dir().join("control.sock"), commands, events, ctx));
         Self {
             tx,
             rx,
             snapshot: None,
             error: String::new(),
+            connection_error: String::new(),
             selected: None,
             new_bus: None,
             bus_name: String::new(),
@@ -572,27 +618,7 @@ impl eframe::App for App {
             Err(e) => self.error = format!("Could not save UI scale: {e}"),
             _ => {}
         }
-        while let Ok(event) = self.rx.try_recv() {
-            match event {
-                Event::Snapshot(snapshot) => {
-                    if snapshot.scene.strips.iter().any(|s| !s.inserts.is_empty()) {
-                        self.ensure_catalog();
-                    }
-                    self.snapshot = Some(snapshot);
-                }
-                Event::Error(e) => self.error = e,
-                Event::Catalog(result) => {
-                    self.catalog_loading = false;
-                    match result {
-                        Ok(value) => {
-                            self.catalog = value;
-                            self.catalog_error.clear();
-                        }
-                        Err(e) => self.catalog_error = e,
-                    }
-                }
-            }
-        }
+        self.receive_events();
         let snapshot = self.snapshot.clone();
         egui::Panel::top("header")
             .frame(egui::Frame::new().fill(PANEL).inner_margin(16.0))
@@ -623,10 +649,11 @@ impl eframe::App for App {
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new(
-                        snapshot
-                            .as_ref()
-                            .map(|s| s.status.as_str())
-                            .unwrap_or("Waiting for service"),
+                        if self.connection_error.is_empty() {
+                            snapshot.as_ref().map(|s| s.status.as_str()).unwrap_or("Waiting for service")
+                        } else {
+                            &self.connection_error
+                        },
                     )
                     .small()
                     .color(DIM),
@@ -786,6 +813,7 @@ fn test_app() -> (App, mpsc::Receiver<Command>) {
         rx,
         snapshot: None,
         error: String::new(),
+        connection_error: String::new(),
         selected: None,
         new_bus: None,
         bus_name: String::new(),

@@ -369,6 +369,18 @@ wireplumber.profiles = { main = { custom.alixer-output-name-test = required } }
             command(["pw-cli","destroy",str(sink["id"])])
             wait(lambda:len(playback_sinks())==1 and playback_sinks()[0]["info"]["props"]["object.serial"]!=sink["info"]["props"]["object.serial"],"externally removed live sink recreated")
             wait(lambda:any(p[1]>.01 for p in snapshot()["peaks"]),"audio restored after external sink removal")
+            # A metadata outage is a session-manager restart, not a routing edit.
+            # Exercise existing playback plus fresh admissions after each restart.
+            for restart in range(2):
+                wp.terminate();assert wp.wait(timeout=5)==0
+                wait(lambda:snapshot()["status"]=="Reconnecting to WirePlumber","session-manager outage detected")
+                assert not snapshot()["conflicts"],"WirePlumber downtime must not suspend saved routing"
+                wp=spawn(["wireplumber"])
+                wait(lambda:strip in snapshot()["active_streams"] and any(p[1]>.01 for p in snapshot()["peaks"]),"existing playback recovers after session-manager restart")
+                assert not snapshot()["conflicts"],"restarting WirePlumber must not create routing conflicts"
+                browser=spawn(["pw-play","--target","test.speakers","--properties",f"{{ application.name = RestartBrowser{restart} media.name = RestartBrowser{restart} }}",str(silent)])
+                wait(lambda:any(s["identity"]["application"]==f"RestartBrowser{restart}" and s["managed"] for s in snapshot()["observation"]["streams"]),"new stream admitted after session-manager restart")
+                browser.terminate();browser.wait(timeout=5)
             player.terminate();player.wait(timeout=5)
             wait(lambda:not playback_sinks(),"recreated sink collected after app exits")
             # PulseAudio clients also wait for the complete path before their

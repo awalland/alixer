@@ -36,6 +36,8 @@ the GUI connects to the independently running service.
 | Audio service | `alixerd` / `alixer.service` |
 | Command-line client | `alixerctl` |
 
+The GUI reconnects automatically when the service restarts. The service resumes
+automatically after WirePlumber or PipeWire restarts, retaining saved mixer routing.
 The service keeps audio running when the GUI closes. Its PipeWire graph sleeps
 when no playback or connected, routed microphone inputs need processing. Metering
 runs for GUI subscribers and explicit snapshot requests; unrouted microphone
