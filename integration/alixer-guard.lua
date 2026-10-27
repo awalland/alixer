@@ -114,6 +114,11 @@ SimpleEventHook {
     local requested = metadata and metadata:find(props["node.id"], "target.object")
     requested = requested or props["target.object"] or remembered_target(props)
     if requested and (tostring(requested):match("^alixer%.") or tostring(requested):match("^lixer%.")) then
+      -- Native streams may have no ports until policy configures DSP mode.
+      -- Rust needs those ports to rediscover the stream and recreate its sink;
+      -- stopping before configuration deadlocks returning applications.
+      local format, mode = si:get_ports_format()
+      if mode ~= "dsp" then si:set_ports_format(format, "dsp", function() end) end
       -- Stop before default selection, leaving the registered stream alive.
       event:stop_processing()
     end

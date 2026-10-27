@@ -362,7 +362,9 @@ wireplumber.profiles = { main = { custom.alixer-output-name-test = required } }
             time.sleep(.5)
             assert not playback_sinks(),"saved settings must not recreate offline playback sinks"
             assert next(s for s in snapshot()["scene"]["strips"] if s["id"]==strip)["gain"]==.6
-            player=spawn(["pw-play","--target","test.speakers",str(path)])
+            # No explicit device: a remembered Alixer target must still allow
+            # native DSP port discovery before its offline sink is recreated.
+            player=spawn(["pw-play",str(path)])
             wait(lambda:strip in snapshot()["active_streams"],"returning app reuses saved strip")
             wait(lambda:len(playback_sinks())==1 and any(p[1]>.01 for p in snapshot()["peaks"]),"returning app gets a working sink")
             sink=playback_sinks()[0]
