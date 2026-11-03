@@ -923,10 +923,12 @@ fn run(
             ingresses.retain(|name, _| pending_ingresses.borrow().contains(name)
                 || graph.borrow().objects.values().any(|node| node.kind == "Node"
                     && node.props.get("node.name") == Some(name)));
-            let key=topology_signature(apply);
+            // Presence changes the processing plan even when saved intent is unchanged.
+            // Retain plugin instances across these handovers; absent streams are not run.
+            let key=format!("{}:{live_strips:?}", topology_signature(apply));
             if *signature!=key {
                 let rebuild=if let Some(current)=render.as_mut(){
-                    match current.reconfigure(&apply.scene,&apply.suspended,*rate){
+                    match current.reconfigure(&apply.scene,&apply.suspended,&live_strips,*rate){
                         Ok(render::Reconfigure::Applied)=>{*signature=key.clone();render_error.clear();false}
                         Ok(render::Reconfigure::Busy)=>false,
                         Ok(render::Reconfigure::Rebuild)=>true,
@@ -941,7 +943,7 @@ fn run(
                     for captured in &captured{if let Some(strip)=scene.strips.iter_mut().find(|s|s.id==captured.strip){if let Some(slot)=strip.inserts.iter_mut().find(|s|s.id==captured.insert){slot.state=Some(captured.path.clone());}}}
                     states.extend(captured);
                 }
-                match render::Render::new(&core,&scene,&apply.suspended,*rate,metering.clone()) {
+                match render::Render::new(&core,&scene,&apply.suspended,&live_strips,*rate,metering.clone()) {
                     Ok(new)=>{*render=Some(new);render_error.clear();*signature=key.clone();}
                     Err(e)=>{*render_error=format!("{e:#}");}
                 }

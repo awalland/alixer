@@ -31,7 +31,8 @@ before rpmbuild; compilation and tests run with Cargo's --frozen flag. Artifacts
 and build caches are kept under target/rpm. Build concurrency defaults to two
 jobs; CARGO_BUILD_JOBS overrides it.
 
-Publish the RPMs of the current workspace version to the Gitea RPM registry:
+Publish the binary RPMs of the current workspace version to the Gitea RPM registry,
+and its source RPM as the generic package `alixer-source`:
 
 ```sh
 bash packaging/rpm/build.sh --publish
@@ -49,6 +50,9 @@ Create the token in Gitea under Settings / Applications with only the
 stale artifacts under target/rpm are never published. The token is passed to
 curl via stdin, never as a command-line argument.
 
+Source RPMs are stored separately because their headers report the build
+architecture, which would collide with the binary in Gitea's RPM registry.
+
 If Rust is provided by rustup rather than RPM, RPM's build-dependency check may
 not recognize it. After verifying all required tools/libraries are installed,
 use `bash packaging/rpm/build.sh --skip-build-deps`. This does not make the
@@ -60,7 +64,7 @@ The RPM requires the LSP LV2 effects package (`lv2-lsp-plugins` on openSUSE,
 Install the matching binary RPM with zypper (replace the filename as needed):
 
 ```sh
-sudo zypper install ./target/rpm/RPMS/x86_64/alixer-0.2.12-1.x86_64.rpm
+sudo zypper install ./target/rpm/RPMS/x86_64/alixer-0.2.13-1.x86_64.rpm
 alixerctl enable
 systemctl --user daemon-reload
 systemctl --user restart wireplumber.service

@@ -30,11 +30,18 @@ struct Plan {
     controls: Vec<(Id, Arc<Controls>)>,
     route_controls: Vec<(Id, Arc<RouteControls>)>,
     effects: Vec<(Id, Vec<alixer_lv2::Instance>)>,
+    effect_indices: BTreeMap<Id, usize>,
     transfer: Option<alixer_core::dsp::RuntimeTransfer>,
     reuse_effects: Vec<(usize, usize)>,
     rate: Arc<AtomicU32>,
     expected_rate: u32,
     overflow: Arc<AtomicBool>,
+}
+
+fn effect_indices(scene: &Scene) -> BTreeMap<Id, usize> {
+    scene.strips.iter().enumerate()
+        .filter(|(_, s)| s.inserts.iter().any(|insert| !insert.bypass))
+        .map(|(index, s)| (s.id, index)).collect()
 }
 
 #[derive(Default)]
@@ -169,15 +176,17 @@ unsafe extern "C" fn process(data: *mut c_void, position: *mut pw::spa::sys::spa
                 },
             );
         }
-        for (id, chain) in &data.effects {
+        for (&id, &index) in &data.effect_indices {
+            let chain = &data.effects[index].1;
             data.processor
-                .set_latency(*id, chain.iter().map(|i| i.latency()).sum());
+                .set_latency(id, chain.iter().map(|i| i.latency()).sum());
         }
         let effects = &mut data.effects;
+        let effect_indices = &data.effect_indices;
         data.processor
             .process_with(frames, rate.max(1.0), |id, channels, frames| {
-                if let Some((_, chain)) = effects.iter_mut().find(|(key, _)| *key == id) {
-                    for effect in chain {
+                if let Some(&index) = effect_indices.get(&id) {
+                    for effect in &mut effects[index].1 {
                         effect.run(channels, frames);
                     }
                 }
@@ -216,10 +225,11 @@ impl Render {
         core: &pw::core::CoreRc,
         scene: &Scene,
         suspended: &BTreeSet<Id>,
+        active_streams: &BTreeSet<Id>,
         sample_rate: u32,
         metering: Arc<super::Metering>,
     ) -> Result<Self> {
-        Self::new_named(core, scene, suspended, sample_rate, metering, "alixer.engine")
+        Self::new_named(core, scene, suspended, sample_rate, metering, "alixer.engine", Some(active_streams))
     }
     /// An unrouted hardware input gets its own clock domain for UI previews.
     pub fn new_preview(
@@ -228,7 +238,7 @@ impl Render {
         sample_rate: u32,
         metering: Arc<super::Metering>,
     ) -> Result<Self> {
-        Self::new_named(core, scene, &BTreeSet::new(), sample_rate, metering, "alixer.preview")
+        Self::new_named(core, scene, &BTreeSet::new(), sample_rate, metering, "alixer.preview", None)
     }
     pub fn new_event(
         core: &pw::core::CoreRc,
@@ -236,7 +246,7 @@ impl Render {
         sample_rate: u32,
         metering: Arc<super::Metering>,
     ) -> Result<Self> {
-        Self::new_named(core, scene, &BTreeSet::new(), sample_rate, metering, "alixer.system")
+        Self::new_named(core, scene, &BTreeSet::new(), sample_rate, metering, "alixer.system", None)
     }
     fn new_named(
         core: &pw::core::CoreRc,
@@ -245,6 +255,7 @@ impl Render {
         sample_rate: u32,
         metering: Arc<super::Metering>,
         prefix: &str,
+        active_streams: Option<&BTreeSet<Id>>,
     ) -> Result<Self> {
         let mut mixer_scene = scene.clone();
         mixer_scene.strips.retain(|s| s.kind != StripKind::SystemSounds);
@@ -321,7 +332,10 @@ impl Render {
             hold_peaks: prefix == "alixer.system",
             handoff: handoff.clone(),
             active: Box::new(Plan {
-                processor: Processor::new(effective, MAX_FRAMES)?,
+                processor: match active_streams {
+                    Some(active) => Processor::new_active(effective, MAX_FRAMES, active)?,
+                    None => Processor::new(effective, MAX_FRAMES)?,
+                },
                 inputs: vec![],
                 outputs: vec![],
                 controls: controls.iter().map(|(id, c)| (*id, c.clone())).collect(),
@@ -330,6 +344,7 @@ impl Render {
                     .map(|(id, c)| (*id, c.clone()))
                     .collect(),
                 effects,
+                effect_indices: effect_indices(scene),
                 transfer: None,
                 reuse_effects: vec![],
                 rate: rate.clone(),
@@ -395,7 +410,9 @@ impl Render {
                         "false"
                     },
                 )?;
-                this._data.active.inputs.push((strip.id, ch, port));
+                if strip.kind != StripKind::Stream || active_streams.is_none_or(|ids| ids.contains(&strip.id)) {
+                    this._data.active.inputs.push((strip.id, ch, port));
+                }
                 this.input_ports.insert((strip.id, ch), port);
                 this.input_names.insert((strip.id, ch), name);
             }
@@ -507,6 +524,7 @@ impl Render {
         &mut self,
         scene: &Scene,
         suspended: &BTreeSet<Id>,
+        active_streams: &BTreeSet<Id>,
         sample_rate: u32,
     ) -> Result<Reconfigure> {
         let mut mixer_scene = scene.clone();
@@ -547,7 +565,7 @@ impl Render {
                 s.mute = true;
             }
         }
-        let processor = Processor::new(effective, MAX_FRAMES)?;
+        let processor = Processor::new_active(effective, MAX_FRAMES, active_streams)?;
         let transfer = processor.prepare_transfer(&self.scene);
         let controls: BTreeMap<_, _> = scene
             .strips
@@ -605,7 +623,9 @@ impl Render {
                     self.input_ports.insert(key, port);
                     port
                 };
-                inputs.push((s.id, ch, port));
+                if s.kind != StripKind::Stream || active_streams.contains(&s.id) {
+                    inputs.push((s.id, ch, port));
+                }
                 input_names.insert(key, name);
             }
         }
@@ -665,6 +685,7 @@ impl Render {
                 .map(|(id, c)| (*id, c.clone()))
                 .collect(),
             effects: scene.strips.iter().map(|s| (s.id, vec![])).collect(),
+            effect_indices: effect_indices(scene),
             transfer: Some(transfer),
             reuse_effects,
             rate: self.rate.clone(),
@@ -846,6 +867,7 @@ mod tests {
                 controls: vec![],
                 route_controls: vec![],
                 effects: scene.strips.iter().map(|s| (s.id, vec![])).collect(),
+                effect_indices: effect_indices(scene),
                 transfer,
                 reuse_effects: vec![],
                 rate: rate.clone(),

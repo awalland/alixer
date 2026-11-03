@@ -186,16 +186,16 @@ pub fn reconcile(
             .get(&key)
             .copied()
             .filter(|id| saved.strip(*id).is_some());
-        let candidates: Vec<_> = saved
+        let available: Vec<_> = saved
             .strips
             .iter()
             .filter(|s| {
                 s.identity.as_ref() == Some(&stream.identity)
-                    && !claimed.contains(&s.id)
                     && reserved.get(&s.id).is_none_or(|k| k == &key)
             })
             .map(|s| s.id)
             .collect();
+        let candidates: Vec<_> = available.iter().copied().filter(|id| !claimed.contains(id)).collect();
         // Surviving incarnations already have reserved strips. Only unmatched
         // streams compete for the remaining saved settings.
         let returning = actual
@@ -217,6 +217,14 @@ pub fn reconcile(
             recent[0]
         } else if returning == 1 && candidates.len() == 1 {
             candidates[0]
+        } else if let Some(&first) = candidates.first().filter(|&&first| {
+            available.len() >= returning
+                && !existing.iter().any(|c| c.strip.is_some_and(|id| available.contains(&id)))
+                && available.iter().all(|&other| equivalent_mix(saved, first, other))
+        }) {
+            // Indistinguishable saved mixes are interchangeable. Reuse an
+            // unclaimed slot instead of growing history on every browser restart.
+            first
         } else {
             // Ambiguous identity is not an outside routing edit. Use an
             // independent default strip rather than suspending playback or
@@ -299,6 +307,21 @@ pub fn reconcile(
     result
 }
 
+fn equivalent_mix(scene: &Scene, a: Id, b: Id) -> bool {
+    let mut left = scene.strip(a).expect("candidate exists").clone();
+    let right = scene.strip(b).expect("candidate exists");
+    left.id = b;
+    if &left != right { return false; }
+    let routes = |id| {
+        let mut routes: Vec<_> = scene.routes.iter().filter(|r| r.source == id)
+            .map(|r| (r.destination.clone(), r.source_channel, r.target_channel, r.gain, r.tap))
+            .collect();
+        routes.sort_by(|a, b| (&a.0, a.1, a.2).cmp(&(&b.0, b.1, b.2)));
+        routes
+    };
+    routes(a) == routes(b)
+}
+
 fn conflict(
     conflicts: &mut Vec<Conflict>,
     strip: Option<Id>,
@@ -340,6 +363,39 @@ pub fn replace_outputs(scene: &mut Scene, strip: Id, targets: &[(String, usize, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn equivalent_saved_streams_are_reused_across_restarts_and_overlaps() {
+        let mut actual = Observation { streams: vec![stream(), stream()], ..Default::default() };
+        actual.streams[1].runtime.serial = "43".into();
+        let initial = reconcile(&Scene::default(), &Checkpoint::default(), &actual, &[]);
+        assert_eq!(initial.bindings.values().collect::<BTreeSet<_>>().len(), 2);
+        for restart in 0..20 {
+            actual.streams[0].runtime.serial = format!("{restart}-a");
+            actual.streams[1].runtime.serial = format!("{restart}-b");
+            let next = reconcile(&initial.scene, &Checkpoint::default(), &actual, &[]);
+            assert_eq!(next.scene, initial.scene, "identical saved mixes must not accumulate");
+            assert_eq!(next.bindings.values().collect::<BTreeSet<_>>().len(), 2);
+        }
+        let mut different = initial.scene.clone();
+        different.routes[0].destination = Destination::Output("other-device".into());
+        actual.streams.truncate(1);
+        let next = reconcile(&different, &Checkpoint::default(), &actual, &[]);
+        assert_eq!(next.scene.strips.len(), different.strips.len() + 1,
+            "different saved routing must not be assigned arbitrarily");
+    }
+    #[test]
+    fn simultaneous_returns_do_not_compete_for_one_customized_saved_mix() {
+        let mut actual = Observation { streams: vec![stream()], ..Default::default() };
+        let mut saved = reconcile(&Scene::default(), &Checkpoint::default(), &actual, &[]).scene;
+        let id = saved.strips[0].id;
+        saved.strips[0].gain = 0.2;
+        let mut second = stream();
+        second.runtime.serial = "43".into();
+        actual.streams.push(second);
+        let next = reconcile(&saved, &Checkpoint::default(), &actual, &[]);
+        assert!(next.bindings.values().all(|&bound| bound != id));
+        assert_eq!(next.scene.strip(id).unwrap().gain, 0.2);
+    }
     #[test]
     fn output_controls_are_adopted_without_erasing_master_settings() {
         let mut actual = Observation::default();

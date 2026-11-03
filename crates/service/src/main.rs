@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod ipc_tests;
 mod output_names;
+mod retention;
 mod store;
 use alixer_core::{
     reconcile::{self, Checkpoint},
@@ -20,7 +21,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         mpsc,
     },
-    time::Duration,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use store::{Saved, Store};
 static STOP: AtomicBool = AtomicBool::new(false);
@@ -155,6 +156,7 @@ fn main() -> Result<()> {
     let mut channel_peaks = vec![];
     let mut plugin_meters = vec![];
     let mut output_controls = vec![];
+    let mut last_cleanup = Instant::now();
     // Metadata is immutable for a running service; knob drags must not rescan LV2 bundles.
     let mut plugin_metadata = std::collections::BTreeMap::new();
     if let Err(e) = output_names::write(&saved.scene, &output_names::config_path()) {
@@ -189,6 +191,9 @@ fn main() -> Result<()> {
                 plugin_meters = update.plugin_meters;
                 if status.starts_with("Disconnected") {
                     apply_dirty = true;
+                    // Unknown activity must not age channels towards deletion.
+                    saved.retention.absent_since.clear();
+                    observation_seen = false;
                 }
                 // A disconnect is not a new baseline and cannot erase a usable observation.
                 if status.starts_with("Connected") || status.starts_with("Audio error") {
@@ -201,12 +206,15 @@ fn main() -> Result<()> {
                             &actual,
                             &saved.conflicts,
                         );
+                        saved.retention.protect_changed_routes(&saved.scene, &reconciled.scene);
                         saved.scene = reconciled.scene;
                         saved.conflicts = reconciled.conflicts;
                         saved.checkpoint = Checkpoint {
                             observation: actual.clone(),
                             bindings: reconciled.bindings,
                         };
+                        let present = active_stream_ids(&actual, &saved.checkpoint).into_iter().collect();
+                        retention::observe(&mut saved, &present, unix_seconds());
                         store.save(&saved, None)?;
                         apply_dirty = true;
                     }
@@ -307,6 +315,7 @@ fn main() -> Result<()> {
                             }
                             _ => {}
                         }
+                        next.retention.protect_edit(&next.scene, edit);
                         next.scene.edit(edit.clone())?;
                         store.save(&next, Some(&serde_json::to_string(&request.command)?))?;
                         saved = next;
@@ -350,6 +359,9 @@ fn main() -> Result<()> {
                             .cloned()
                             .context("Unknown conflict")?;
                         let mut next = saved.clone();
+                        if let Some(id) = c.strip {
+                            next.retention.protected.insert(id);
+                        }
                         if !restore {
                             if let Some(strip) = c.strip {
                                 reconcile::replace_outputs(&mut next.scene, strip, &c.current);
@@ -377,6 +389,22 @@ fn main() -> Result<()> {
                 result: result.map_err(|e| format!("{e:#}")),
             };
             let _ = incoming.reply.send(reply);
+        }
+        if last_cleanup.elapsed() >= Duration::from_secs(retention::SWEEP_SECONDS) {
+            last_cleanup = Instant::now();
+            if observation_seen && status.starts_with("Connected") {
+                let present = active_stream_ids(&actual, &saved.checkpoint).into_iter().collect();
+                retention::observe(&mut saved, &present, unix_seconds());
+                let removed = retention::sweep(&mut saved, unix_seconds())?;
+                store.save(&saved, None)?;
+                if removed > 0 {
+                    eprintln!("Removed {removed} default playback channels absent for one hour");
+                    apply_dirty = true;
+                    publish_dirty = true;
+                    peaks.retain(|(id, _)| saved.scene.strip(*id).is_some());
+                    channel_peaks.retain(|(id, _)| saved.scene.strip(*id).is_some());
+                }
+            }
         }
         if apply_dirty {
             if let Some(backend) = &backend {
@@ -418,6 +446,9 @@ fn main() -> Result<()> {
     // process's DSP links disappear, preserving explicit outside mute independently.
     std::fs::remove_file(socket)?;
     Ok(())
+}
+fn unix_seconds() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
 }
 fn active_stream_ids(actual: &Observation, checkpoint: &Checkpoint) -> Vec<Id> {
     actual

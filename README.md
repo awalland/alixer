@@ -46,7 +46,10 @@ preview filters, so opening or closing the GUI does not attach their capture
 clocks to playback.
 Playback sinks exist only while an application stream needs them, including while
 paused. New playback waits for its mixer path before the first connection,
-avoiding a brief burst through the desktop output followed by a routing gap. Saved strips keep their settings without leaving unused output devices.
+avoiding a brief burst through the desktop output followed by a routing gap. Absent
+playback strips keep their settings without consuming sample-processing time or
+allocating audio buffers and route delay lines. Returning streams reuse identical
+saved mixes; ambiguous streams with different settings remain separate.
 Stopping or crashing the service releases playback to normal desktop routing
 and removes its playback sinks. The virtual microphone stays silent on ordinary
 shutdown so recording applications do not fall back to a hardware microphone.
@@ -246,6 +249,21 @@ Mixer state and GUI preferences are saved under `~/.local/state/alixer` (or
 `$XDG_STATE_HOME/alixer`). Use `ALIXER_STATE_DIR` for an isolated state directory.
 Restart the service after updating the binaries.
 
+The service checks playback history once a minute and removes default playback
+channels that have been absent for at least one hour, together with their routes.
+Paused streams still count as present. Returning before the hour resets the timer.
+Existing channels without an absence timestamp get a full hour after upgrading.
+Absence timestamps survive service restarts; cleanup waits for a connected audio
+backend and resets the timers if PipeWire disconnects.
+
+Customized playback channels are retained: effects, gain/mute/solo, names, colors,
+custom routing, aux sends, and unresolved routing conflicts protect a channel.
+Explicit channel edits remain protected even after their values are reset; saved
+edit history also protects channels from older versions. Reordering strips or
+resetting the color palette alone does not prevent cleanup. Hardware inputs,
+outputs, groups, aux masters, system sounds, and the virtual microphone are never
+removed by this cleanup. No separate cron or systemd timer is needed.
+
 ## Removing Alixer's audio integration
 
 Close the GUI, then run this as your normal desktop user, without `sudo`:
@@ -288,6 +306,7 @@ python3 tests/runtime.py --offline
 python3 tests/runtime.py
 python3 tests/capture.py
 python3 tests/system_sounds.py
+python3 tests/retention.py
 ```
 
 Runtime tests start private PipeWire, WirePlumber, and D-Bus instances with
@@ -298,6 +317,21 @@ for the test-only LV2 fixture. The live test checks clean native/PulseAudio star
 sample, uninterrupted playback and plugin lifetime while unrelated streams open
 and close, suspension before and
 after playback, idle CPU use, and microphone preview cleanup after UI disconnects.
+
+Steady faders and route gains use buffer operations that the compiler can
+vectorize. Gain smoothing runs only while a value is changing. Zero-delay routes
+mix directly, while retaining delay history in bulk for future plugin latency
+changes. Delay compensation is recalculated only when topology or latency changes.
+
+To benchmark 1, 100, and 600 active stereo streams at small and large buffer sizes:
+
+```sh
+cargo run --release -p alixer-core --example mixer_bench
+```
+
+This includes buffer clearing, input/output copies, control updates, and mixing.
+It excludes plugins, metering, PipeWire and service/UI overhead; its percentage
+estimates one CPU core's time from elapsed time per audio block.
 
 ### Native LV2 tests
 

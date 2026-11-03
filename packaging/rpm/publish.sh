@@ -29,7 +29,7 @@ version="$(cargo metadata --no-deps --locked --format-version=1 \
     | jq -r '.packages[] | select(.name=="alixer") | .version')"
 upload_url="${GITEA_BASE_URL%/}/api/packages/${GITEA_PACKAGE_OWNER}/rpm/upload"
 rpms=()
-for arch in x86_64 noarch; do
+for arch in x86_64 aarch64 noarch; do
     [[ -f "$top/RPMS/$arch/alixer-$version-1.$arch.rpm" ]] && \
         rpms+=("$top/RPMS/$arch/alixer-$version-1.$arch.rpm")
 done
@@ -44,3 +44,14 @@ for rpm in "${rpms[@]}"; do
         curl --fail-with-body --silent --show-error --config - \
             --upload-file "$rpm" "$upload_url"
 done
+# Source RPM headers still name the build architecture. Gitea's RPM registry
+# keys files by that header, which would collide with the binary RPM. Keep the
+# original source filename in a separate generic package instead.
+source_rpm="$top/SRPMS/alixer-$version-1.src.rpm"
+if [[ -f "$source_rpm" ]]; then
+    source_url="${GITEA_BASE_URL%/}/api/packages/${GITEA_PACKAGE_OWNER}/generic/alixer-source/$version-1/$(basename -- "$source_rpm")"
+    echo "Publishing $(basename -- "$source_rpm") to $source_url"
+    printf 'user = "%s:%s"\n' "$GITEA_USERNAME" "$GITEA_TOKEN" | \
+        curl --fail-with-body --silent --show-error --config - \
+            --upload-file "$source_rpm" "$source_url"
+fi
