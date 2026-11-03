@@ -15,7 +15,7 @@ for arg in "$@"; do
 done
 for tool in cargo rustc jq rg tar zstd rpmbuild; do command -v "$tool" >/dev/null; done
 top="$root/target/rpm"
-mkdir -p "$top"/{SOURCES,SPECS,BUILD,BUILDROOT,RPMS,SRPMS}
+mkdir -p "$top"/{SOURCES,SPECS,BUILD,BUILDROOT,RPMS}
 stage="$(mktemp -d "$top/staging.XXXXXX")"
 cargo metadata --no-deps --locked --format-version=1 > "$stage/workspace.json"
 version="$(jq -r '.packages[] | select(.name=="alixer") | .version' "$stage/workspace.json")"
@@ -49,10 +49,9 @@ tar --zstd -C "$stage" -cf "$top/SOURCES/alixer-$version-vendor.tar.zst" \
     vendor vendor-config.toml third-party-licenses
 echo "Prepared sources and spec under $top"
 if [[ "$mode" == build ]]; then
-    rpmbuild -ba "${rpm_options[@]}" --define "_topdir $top" \
+    rpmbuild -bb "${rpm_options[@]}" --define "_topdir $top" \
         --define "alixer_jobs ${CARGO_BUILD_JOBS:-2}" "$top/SPECS/alixer.spec"
     echo "Binary RPMs: $top/RPMS"
-    echo "Source RPMs: $top/SRPMS"
     if $publish; then
         bash "$root/packaging/rpm/publish.sh"
     fi

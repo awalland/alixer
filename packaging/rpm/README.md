@@ -26,13 +26,12 @@ bash packaging/rpm/build.sh
 ```
 
 The script vendors Cargo.lock dependencies, prepares source archives and license
-notices, then builds both source and binary RPMs. Downloading dependencies occurs
+notices, then builds binary RPMs. Downloading dependencies occurs
 before rpmbuild; compilation and tests run with Cargo's --frozen flag. Artifacts
 and build caches are kept under target/rpm. Build concurrency defaults to two
 jobs; CARGO_BUILD_JOBS overrides it.
 
-Publish the binary RPMs of the current workspace version to the Gitea RPM registry,
-and its source RPM as the generic package `alixer-source`:
+Publish the binary RPMs of the current workspace version to the Gitea RPM registry:
 
 ```sh
 bash packaging/rpm/build.sh --publish
@@ -49,9 +48,6 @@ Create the token in Gitea under Settings / Applications with only the
 `write:package` scope. Only RPMs matching the workspace version are uploaded, so
 stale artifacts under target/rpm are never published. The token is passed to
 curl via stdin, never as a command-line argument.
-
-Source RPMs are stored separately because their headers report the build
-architecture, which would collide with the binary in Gitea's RPM registry.
 
 If Rust is provided by rustup rather than RPM, RPM's build-dependency check may
 not recognize it. After verifying all required tools/libraries are installed,

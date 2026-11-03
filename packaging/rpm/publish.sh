@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Upload the RPMs of the current workspace version to the Gitea RPM registry.
+# Upload the binary RPMs of the current workspace version to the Gitea RPM registry.
 # Reads credentials from publish.env in the repository root (0600, gitignored),
 # overridable with ALIXER_PUBLISH_CONFIG or environment variables. Create it
 # from publish.env.example; it needs:
@@ -44,14 +44,3 @@ for rpm in "${rpms[@]}"; do
         curl --fail-with-body --silent --show-error --config - \
             --upload-file "$rpm" "$upload_url"
 done
-# Source RPM headers still name the build architecture. Gitea's RPM registry
-# keys files by that header, which would collide with the binary RPM. Keep the
-# original source filename in a separate generic package instead.
-source_rpm="$top/SRPMS/alixer-$version-1.src.rpm"
-if [[ -f "$source_rpm" ]]; then
-    source_url="${GITEA_BASE_URL%/}/api/packages/${GITEA_PACKAGE_OWNER}/generic/alixer-source/$version-1/$(basename -- "$source_rpm")"
-    echo "Publishing $(basename -- "$source_rpm") to $source_url"
-    printf 'user = "%s:%s"\n' "$GITEA_USERNAME" "$GITEA_TOKEN" | \
-        curl --fail-with-body --silent --show-error --config - \
-            --upload-file "$source_rpm" "$source_url"
-fi
