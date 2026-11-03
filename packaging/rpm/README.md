@@ -31,6 +31,9 @@ before rpmbuild; compilation and tests run with Cargo's --frozen flag. Artifacts
 and build caches are kept under target/rpm. Build concurrency defaults to two
 jobs; CARGO_BUILD_JOBS overrides it.
 
+Releases only need binary RPMs. Do not build or upload source RPMs (`.src.rpm`);
+the source archives above are inputs for building the binary packages.
+
 Publish the binary RPMs of the current workspace version to the Gitea RPM registry:
 
 ```sh
