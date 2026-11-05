@@ -143,6 +143,11 @@ the main mixer's insert graph, and have no routing, aux-send, solo, or effect co
 sounds remain ordinary playback streams. Existing saved event strips are
 consolidated automatically without changing other playback strips.
 
+The main mixer requests a steady latency of 1024/48000 seconds (about 21 ms),
+so a short notification requesting a larger buffer does not resize the playback
+graph twice and disturb device resampling. PipeWire can still choose smaller
+blocks for lower-latency clients; this does not force or lock the global quantum.
+
 The WirePlumber integration applies saved controls before a short sound starts.
 After updating a development build, run `alixerctl enable` again and restart
 WirePlumber to refresh its script. Use the matching GUI and daemon binaries.

@@ -76,12 +76,12 @@ with tempfile.TemporaryDirectory(prefix="alixer-events-") as tmp:
                 time.sleep(.05)
         raise AssertionError("Repeated stale revision")
 
-    def tone(name, amplitude, seconds):
+    def tone(name, amplitude, seconds, rate=48000):
         path = root / name
         with wave.open(str(path), "wb") as wav:
-            wav.setparams((2, 2, 48000, 0, "NONE", "not compressed"))
-            samples = array.array("h", [int(amplitude * math.sin(n * 2 * math.pi * 440 / 48000))
-                                        for n in range(int(48000 * min(1, seconds))) for _ in range(2)])
+            wav.setparams((2, 2, rate, 0, "NONE", "not compressed"))
+            samples = array.array("h", [int(amplitude * math.sin(n * 2 * math.pi * 440 / rate))
+                                        for n in range(int(rate * min(1, seconds))) for _ in range(2)])
             for _ in range(max(1, int(seconds))):
                 wav.writeframesraw(samples.tobytes())
         return path
@@ -90,11 +90,12 @@ with tempfile.TemporaryDirectory(prefix="alixer-events-") as tmp:
         return spawn(["pw-play", "--target", target, "--properties",
                       f"{{ node.name = {name} {properties} }}", str(path)])
 
-    def capture(target, count=24000):
+    def capture(target, count=24000, latency=None):
         path = root / f"{uuid.uuid4()}.f32"
         recorder = spawn(["pw-record", "--target", target, "--properties",
                           "{ stream.capture.sink = true }", "--rate", "48000", "--channels", "2",
-                          "--format", "f32", "--raw", "--sample-count", str(count), str(path)])
+                          "--format", "f32", "--raw", "--sample-count", str(count),
+                          *(["--latency", str(latency)] if latency is not None else []), str(path)])
         return recorder, path
 
     def captured_peak(recording):
@@ -246,10 +247,70 @@ with tempfile.TemporaryDirectory(prefix="alixer-events-") as tmp:
         wait(lambda: not any(o.get("info", {}).get("props", {}).get("node.name", "").startswith("alixer.event.")
                              for o in json.loads(command(["pw-dump"]))), "event endpoints collected")
         music.terminate(); music.wait(timeout=5)
-        music = player("test.stop.music", "test.right", loud, "media.role = Music")
+        music = spawn(["pw-play", "--target=test.right", "--latency=0", "--properties",
+                       "{ node.name = test.stop.music media.role = Music }", str(loud)])
         wait(lambda: len(snapshot()["active_streams"]) == 1, "managed music before shutdown")
         time.sleep(.4)
         music_id = snapshot()["active_streams"][0]
+        # A silent music fixture cannot reveal interruptions when short events
+        # enter and leave the graph. Mute only the events so the captured tone
+        # must remain continuous, including on their shared destination.
+        edit("Mute", strip=group_id, value=True)
+        # Neither music nor recorder may request latency: that would mask the
+        # bug by already changing the graph quantum before the bell arrives.
+        recording = capture("test.right", 384000, latency=0)
+        profiler = spawn(["pw-profiler", "-J", "-o", "-"])
+        profile = logs[-1]
+        started = time.monotonic()
+        time.sleep(.5)
+        bell = tone("bell.wav", 12000, .15, rate=44100)
+        for target in ("test.right", "test.left"):
+            ping = player("test.continuity.ping", target, short, "media.role = event")
+            assert ping.wait(timeout=5) == 0
+            time.sleep(.7)
+            # Same rate and latency request observed on Hyprland's Foot bell.
+            # paplay expresses buffer sizes in bytes: a stereo s16 process
+            # request of 32768 bytes corresponds to 8192 frames.
+            ping = spawn(["paplay", "--device=" + target, "--latency=131072", "--process-time=32768",
+                          "--property=media.role=Notification",
+                          "--property=event.id=bell-window-system", str(bell)])
+            assert ping.wait(timeout=5) == 0
+            time.sleep(.7)  # Include the event filter's retirement.
+        recorder, path = recording
+        assert recorder.wait(timeout=10) in (0, 1)
+        assert time.monotonic() - started < 9.5, "system sounds stalled the music clock"
+        profiler.terminate(); profiler.wait(timeout=5)
+        profile.flush(); profile.seek(0)
+        content, decoder, clocks, saw_event = profile.read(), json.JSONDecoder(), [], False
+        while content.strip():
+            try:
+                batch, end = decoder.raw_decode(content.lstrip())
+            except json.JSONDecodeError:
+                break  # Termination may interrupt the last profiler record.
+            content = content.lstrip()[end:]
+            clock = None
+            for entry in batch:
+                if entry.get("type") == "clock":
+                    clock = entry
+                elif entry.get("type") == "follower":
+                    if entry["name"].startswith("alixer.engine.") and clock:
+                        clocks.append((clock["duration"], clock["rate"]))
+                    saw_event |= entry["name"].startswith("alixer.system.")
+        assert saw_event and clocks, "profiler must observe music and system sound processing"
+        assert set(clocks) == {(1024, "1/48000")}, f"notifications changed playback timing: {set(clocks)}"
+        samples = array.array("f")
+        samples.frombytes(path.read_bytes())
+        assert len(samples) >= 384000 * 2
+        # Ignore recorder startup only; inspect 5 ms windows across admission
+        # and teardown. A continuous 440 Hz tone has RMS around .17.
+        signal = samples[24000 * 2::2]
+        rms = [math.sqrt(sum(v*v for v in signal[i:i+240]) / 240)
+               for i in range(0, len(signal) - 239, 240)]
+        assert min(rms) > .12, f"system sound interrupted music: minimum RMS={min(rms)}"
+        windows = [signal[i:i+2400] for i in range(0, len(signal)-2399, 2400)]
+        frequencies = [sum(a <= 0 < b for a, b in zip(w, w[1:])) / .05 for w in windows]
+        assert all(abs(hz-440) <= 20 for hz in frequencies), f"system sounds changed music pitch: {frequencies}"
+        edit("Mute", strip=group_id, value=False)
         edit("Gain", strip=music_id, value=.25)
         time.sleep(.2)
         assert .05 < captured_peak(capture("test.right")) < .075
@@ -316,7 +377,7 @@ with tempfile.TemporaryDirectory(prefix="alixer-events-") as tmp:
         metadata = next(o for o in graph if o["type"] == "PipeWire:Interface:Metadata" and o.get("props", {}).get("metadata.name") == "default")["metadata"]
         assert not any(v["key"].startswith(("alixer.", "lixer.")) for v in metadata)
         assert any(v["key"] == "test.keep" and v["value"] == "untouched" for v in metadata)
-        print("PASS: grouped event/Notification/event.id streams, independent destinations, shared gain/mute, short-sound admission, meters, persistence, stop/crash handoff and undeploy cleanup")
+        print("PASS: grouped event/Notification/event.id streams, independent destinations, shared gain/mute, short-sound admission, stable notification timing and music pitch, meters, persistence, stop/crash handoff and undeploy cleanup")
     except Exception:
         for index, log in enumerate(logs):
             log.flush(); log.seek(0)

@@ -63,7 +63,7 @@ The RPM requires the LSP LV2 effects package (`lv2-lsp-plugins` on openSUSE,
 Install the matching binary RPM with zypper (replace the filename as needed):
 
 ```sh
-sudo zypper install ./target/rpm/RPMS/x86_64/alixer-0.2.13-1.x86_64.rpm
+sudo zypper install ./target/rpm/RPMS/x86_64/alixer-0.2.14-1.x86_64.rpm
 alixerctl enable
 systemctl --user daemon-reload
 systemctl --user restart wireplumber.service
@@ -100,5 +100,5 @@ set `ALIXER_TEST_BIN_DIR` to their `usr/bin` directory and run
 the adjacent packaged Lua script while leaving the desktop audio session alone.
 `bash packaging/rpm/check.sh path/to/alixer.rpm` extracts and checks the package,
 then runs both private integration tests. It needs the runtime audio tools,
-Python, a C compiler for the test LV2 plugin, D-Bus, rpm2cpio and cpio; it never installs the RPM or restarts desktop
+Python, a C compiler for the test LV2 plugin, D-Bus, `pw-profiler`, rpm2cpio and cpio; it never installs the RPM or restarts desktop
 services. Extracted test files are retained under target/rpm for inspection.

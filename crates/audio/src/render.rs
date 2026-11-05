@@ -357,7 +357,15 @@ impl Render {
         events.process = Some(process);
         let mut hook = Box::new(unsafe { std::mem::zeroed() });
         let name = format!("{prefix}.{}", Id::new_v4());
-        let props = properties! {"node.name"=>name.clone(),"node.description"=>"Alixer mixer","media.class"=>"Audio/Filter","node.autoconnect"=>"false","node.link-group"=>name.clone(),"audio.rate"=>sample_rate.to_string()};
+        let mut props = properties! {"node.name"=>name.clone(),"node.description"=>"Alixer mixer","media.class"=>"Audio/Filter","node.autoconnect"=>"false","node.link-group"=>name.clone(),"audio.rate"=>sample_rate.to_string()};
+        if prefix == "alixer.engine" {
+            // Without a playback latency request, even a brief notification
+            // requesting a large buffer changes the entire graph's quantum,
+            // then changes it back on exit. Hardware followers must retune
+            // their resamplers each time. Keep a steady desktop mixing budget;
+            // this is a suggestion, so lower-latency clients can still run.
+            props.insert("node.latency", "1024/48000");
+        }
         let filter = unsafe {
             pw::sys::pw_filter_new(core.as_raw_ptr(), c"Alixer".as_ptr(), props.into_raw())
         };
