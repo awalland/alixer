@@ -34,7 +34,9 @@ jobs; CARGO_BUILD_JOBS overrides it.
 Releases only need binary RPMs. Do not build or upload source RPMs (`.src.rpm`);
 the source archives above are inputs for building the binary packages.
 
-Publish the binary RPMs of the current workspace version to the Gitea RPM registry:
+Publishing is local setup: `packaging/rpm/publish.sh` and `publish.env` are
+ignored by Git and are not included in a fresh checkout. The build and Cargo
+wrapper can invoke your local publishing script when it is present:
 
 ```sh
 bash packaging/rpm/build.sh --publish
@@ -42,15 +44,13 @@ bash packaging/rpm/build.sh --publish
 bash packaging/rpm/publish.sh
 ```
 
-Publishing reads `publish.env` in the repository root (mode 600, gitignored) or
-the file named by `ALIXER_PUBLISH_CONFIG`. Start from the template that sits
-next to it: `install -m 600 publish.env.example publish.env`, then edit it. It needs
-`GITEA_BASE_URL`, `GITEA_USERNAME`, `GITEA_PACKAGE_OWNER` (the user or
-organisation that owns the registry, `packages` in the examples) and `GITEA_TOKEN`.
-Create the token in Gitea under Settings / Applications with only the
-`write:package` scope. Only RPMs matching the workspace version are uploaded, so
-stale artifacts under target/rpm are never published. The token is passed to
-curl via stdin, never as a command-line argument.
+For a Gitea publisher, `publish.env.example` provides placeholder settings.
+Copy it with `install -m 600 publish.env.example publish.env`, then set the
+registry URL, username, package owner and token for your own server. Create
+the token in Gitea under Settings / Applications with the `write:package`
+scope. Keep the publishing script and credentials local. The script should
+upload only binary RPMs matching the workspace version and pass credentials
+to curl via stdin rather than command-line arguments.
 
 If Rust is provided by rustup rather than RPM, RPM's build-dependency check may
 not recognize it. After verifying all required tools/libraries are installed,

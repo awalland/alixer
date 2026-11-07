@@ -1,5 +1,6 @@
 /target
 *.sqlite*
-# real credentials, only publish.env.example is tracked
+# Local publishing credentials and script; only the example config is tracked.
 publish.env
+/packaging/rpm/publish.sh
 

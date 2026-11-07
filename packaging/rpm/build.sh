@@ -13,6 +13,10 @@ for arg in "$@"; do
         *) echo "Usage: $0 [--prepare-only] [--skip-build-deps] [--publish]" >&2; exit 2 ;;
     esac
 done
+if $publish && [[ ! -f "$root/packaging/rpm/publish.sh" ]]; then
+    echo "Publishing requires a local packaging/rpm/publish.sh script (not tracked in Git)." >&2
+    exit 1
+fi
 for tool in cargo rustc jq rg tar zstd rpmbuild; do command -v "$tool" >/dev/null; done
 top="$root/target/rpm"
 mkdir -p "$top"/{SOURCES,SPECS,BUILD,BUILDROOT,RPMS}

@@ -10,6 +10,12 @@ subcommand="${1:-build}"; shift || true
 case "$subcommand" in
     build) bash "$here/build.sh" "$@" ;;
     check) bash "$here/check.sh" "$@" ;;
-    publish) bash "$here/publish.sh" "$@" ;;
+    publish)
+        if [[ ! -f "$here/publish.sh" ]]; then
+            echo "Publishing requires a local packaging/rpm/publish.sh script (not tracked in Git)." >&2
+            exit 1
+        fi
+        bash "$here/publish.sh" "$@"
+        ;;
     *) echo "Usage: cargo rpm [build|check|publish] [args...]" >&2; exit 2 ;;
 esac
